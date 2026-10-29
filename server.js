@@ -19,16 +19,24 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { DatabaseSync } = require('node:sqlite');
+
 
 const PORT = Number(process.env.PORT || 8090);
 const HOST = process.env.HOST || '0.0.0.0';
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const INDEX_FILE = path.join(PUBLIC_DIR, 'index.html');
 
+// Persistent storage (SQLite via node:sqlite — no external service needed)
+const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'data', 'energymeter.db');
+const DB_RETENTION_DAYS = Number(process.env.DB_RETENTION_DAYS || 0); // 0 = keep forever
+const RAW_EXPORT_MAX_ROWS = 100000; // refuse raw CSV larger than this; use minute/hour grouping
+
 // ESP32 data source (phase 2)
-const ESP32_URL = process.env.ESP32_URL || 'http://energymeter.local/api/readings';
+const ESP32_URL = process.env.ESP32_URL ?? 'http://energymeter.local/api/readings';
 const ESP32_POLL_MS = Math.max(1000, Number(process.env.ESP32_POLL_MS || 2000));
 const ESP32_TIMEOUT_MS = Number(process.env.ESP32_TIMEOUT_MS || 4000);
+const DEVICE_STALE_MS = 15000;
 // Optional shared secret for POST /api/ingest (header: X-Ingest-Token).
 // Off by default; set when ingesting over a public network.
 const INGEST_TOKEN = process.env.INGEST_TOKEN || '';
@@ -55,6 +63,7 @@ const state = {
     sequence: null, candidate_layout: null, adapter_connected: null,
     baudrate: null, device_id: null, register_count: null, start_address: null,
     age_ms: null, registers: null, feed: 'pull',
+    has_sample: false, meter_error: null, last_sequence_at: null, last_sample_at: null,
   },
   deviceEnergy: { l1: 0, l2: 0, l3: 0 },
   prevDeviceP: { l1: 0, l2: 0, l3: 0 },
@@ -76,6 +85,119 @@ const BASE = {
   l2: { p: 1050, i: 4.9, voff: -0.6 },
   l3: { p: 1180, i: 5.5, voff: 0.4 },
 };
+
+// ---------------------------------------------------------------- database
+
+// One row per sample, all measurements as flat columns (null = unavailable).
+const SAMPLE_COLS = ['t', 'seq', 'source', 'feed', 'freq',
+  ...PHASES.flatMap(ph => PHASE_KEYS.map(k => `${ph}_${k}`)),
+  ...TOTAL_KEYS.map(k => `tot_${k}`)];
+const INSERT_SQL = `INSERT INTO samples (${SAMPLE_COLS.join(',')}) VALUES (${SAMPLE_COLS.map(() => '?').join(',')})`;
+
+// Column → aggregate rule for minute/hour rollups (same semantics as aggregate()).
+function aggExpr(col) {
+  if (col === 't') return '(t / ?) * ?';
+  if (col.endsWith('_min')) return `MIN(${col})`;
+  if (col.endsWith('_max')) return `MAX(${col})`;
+  if (col === 'seq' || col === 'source' || col === 'feed') return `MAX(${col})`; // keep text/identity, not AVG
+  return `AVG(${col})`; // freq, plain metrics and e_wh (monotonic → AVG ok for rollups)
+}
+
+let db = null;        // DatabaseSync instance, null if storage failed to open
+let insertStmt = null;
+
+function openDatabase() {
+  try {
+    fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+    db = new DatabaseSync(DB_PATH);
+    db.exec('PRAGMA journal_mode = WAL;');
+    db.exec('PRAGMA synchronous = NORMAL;');
+    db.exec(`CREATE TABLE IF NOT EXISTS samples (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ${SAMPLE_COLS.map(c => `${c} ${c === 't' || c === 'seq' ? 'INTEGER' : 'REAL'}`).join(',\n      ')}
+    );`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_samples_t ON samples(t);');
+    insertStmt = db.prepare(INSERT_SQL);
+    console.log(`  db:      ${DB_PATH}`);
+    return true;
+  } catch (err) {
+    console.error(`  db:      FAILED to open ${DB_PATH}: ${err.message} — running without persistence`);
+    db = null;
+    insertStmt = null;
+    return false;
+  }
+}
+
+function sampleToRow(s) {
+  const row = [s.t, Number.isInteger(s.seq) ? s.seq : null,
+    state.source, state.source === 'device' ? state.device.feed : null,
+    Number.isFinite(s.freq) ? s.freq : null];
+  for (const ph of PHASES) for (const k of PHASE_KEYS) {
+    const v = s[ph][k];
+    row.push(Number.isFinite(v) ? v : null);
+  }
+  for (const k of TOTAL_KEYS) {
+    const v = s.tot[k];
+    row.push(Number.isFinite(v) ? v : null);
+  }
+  return row;
+}
+
+function rowToSample(r) {
+  const s = { t: r.t, seq: r.seq, freq: r.freq, l1: {}, l2: {}, l3: {}, tot: {} };
+  for (const ph of PHASES) for (const k of PHASE_KEYS) s[ph][k] = r[`${ph}_${k}`] ?? null;
+  for (const k of TOTAL_KEYS) s.tot[k] = r[`tot_${k}`] ?? null;
+  return s;
+}
+
+function dbInsert(s) {
+  if (!insertStmt) return;
+  try { insertStmt.run(...sampleToRow(s)); }
+  catch (err) { console.error(`db insert failed: ${err.message}`); }
+}
+
+function dbStats() {
+  if (!db) return null;
+  try {
+    const row = db.prepare('SELECT COUNT(*) AS n, MIN(t) AS oldest, MAX(t) AS newest FROM samples').get();
+    const size = fs.statSync(DB_PATH).size;
+    return { rows: row.n, size_bytes: size, oldest_t: row.oldest, newest_t: row.newest, path: DB_PATH };
+  } catch { return null; }
+}
+
+// Load persisted history into the in-memory buffers so a restart keeps
+// the live charts (2 h seconds + 7 d minute aggregates).
+function loadHistoryFromDb() {
+  if (!db) return;
+  try {
+    const secRows = db.prepare(`SELECT * FROM samples ORDER BY id DESC LIMIT ?`).all(SEC_MAX);
+    secRows.reverse().forEach(r => state.sec.push(rowToSample(r)));
+    const cutoff = Date.now() - 7 * 86400e3;
+    const bucketMs = 60000;
+    const aggCols = SAMPLE_COLS.filter(c => c !== 't')
+      .map(c => `${aggExpr(c)} AS ${c}`).join(', ');
+    const sql = `SELECT (t / ${bucketMs}) * ${bucketMs} AS t, ${aggCols}
+                 FROM samples WHERE t >= ? GROUP BY 1 ORDER BY 1`;
+    const minRows = db.prepare(sql).all(cutoff);
+    minRows.forEach(r => state.min.push(rowToSample(r)));
+    if (state.sec.length) {
+      state.latest = state.sec[state.sec.length - 1];
+      state.sequence = state.latest.seq || 0;
+    }
+    console.log(`  db:      loaded ${state.sec.length} s + ${state.min.length} min samples into buffers`);
+  } catch (err) {
+    console.error(`db history load failed: ${err.message}`);
+  }
+}
+
+function applyRetention() {
+  if (!db || DB_RETENTION_DAYS <= 0) return;
+  const cutoff = Date.now() - DB_RETENTION_DAYS * 86400e3;
+  try {
+    const { changes } = db.prepare('DELETE FROM samples WHERE t < ?').run(cutoff);
+    if (changes) console.log(`db retention: deleted ${changes} samples older than ${DB_RETENTION_DAYS} days`);
+  } catch (err) { console.error(`db retention failed: ${err.message}`); }
+}
 
 // ---------------------------------------------------------------- helpers
 
@@ -226,6 +348,7 @@ function pushSample(s) {
     state.minuteTail = [];
     if (state.min.length > MIN_MAX) state.min.shift();
   }
+  dbInsert(s);
 }
 
 function tick() {
@@ -271,8 +394,9 @@ function parseEsp32Sample(meter, receivedAt) {
     s[ph].e_wh = 0; // filled by server-side integration below
   }
   // Energy: the meter's energy registers are not decoded yet, so integrate
-  // active power on the server (trapezoid, dt capped at 30 s across gaps).
-  const dt = state.lastDevicePush ? clamp((receivedAt - state.lastDevicePush) / 1000, 0, 30) : 0;
+  // active power on the server. Never integrate across a communication outage.
+  const gap = receivedAt - state.lastDevicePush;
+  const dt = state.lastDevicePush && gap < DEVICE_STALE_MS ? Math.max(0, gap / 1000) : 0;
   for (const ph of PHASES) {
     const p = s[ph].p, prev = state.prevDeviceP[ph];
     state.deviceEnergy[ph] += ((p === null ? 0 : p) + (prev === null ? 0 : prev)) / 2 * dt / 3600;
@@ -312,7 +436,7 @@ function switchToDevice(sample) {
   state.lastDevicePush = 0;
   state.source = 'device';
   state.sim.running = false;
-  pushSample(sample);
+  if (sample) pushSample(sample);
 }
 
 function pushDeviceSample(s, meter) {
@@ -325,13 +449,21 @@ function pushDeviceSample(s, meter) {
 // (ESP32 → server): updates device status, parses the native meter payload
 // and feeds the history buffers.
 function ingestMeterPayload(meter, receivedAt, feed) {
+  if (deviceStatus(receivedAt).stale) state.lastDevicePush = 0;
+  if (meter.has_sample === true && (state.device.last_sequence_at === null
+      || !Number.isInteger(meter.sequence) || meter.sequence !== state.device.sequence)) {
+    state.device.last_sequence_at = receivedAt;
+  }
   state.device.connected = true;
   state.device.last_seen = receivedAt;
   state.device.last_error = null;
-  state.device.stale = meter.stale === true || meter.last_error != null || meter.adapter_connected !== true;
+  state.device.stale = meter.stale === true;
+  state.device.has_sample = meter.has_sample === true;
+  state.device.meter_error = meter.last_error == null || meter.last_error === ''
+    ? null : String(meter.last_error);
   state.device.sequence = Number.isInteger(meter.sequence) ? meter.sequence : null;
   state.device.candidate_layout = meter.candidate_layout === true;
-  state.device.adapter_connected = meter.adapter_connected === true;
+  state.device.adapter_connected = typeof meter.adapter_connected === 'boolean' ? meter.adapter_connected : null;
   state.device.baudrate = Number.isFinite(meter.baudrate) ? meter.baudrate : null;
   state.device.device_id = Number.isInteger(meter.device_id) ? meter.device_id : null;
   state.device.register_count = Array.isArray(meter.registers) ? meter.registers.length : null;
@@ -339,8 +471,14 @@ function ingestMeterPayload(meter, receivedAt, feed) {
   state.device.age_ms = Number.isFinite(meter.age_ms) ? meter.age_ms : null;
   state.device.registers = Array.isArray(meter.registers) ? meter.registers.slice() : null;
   state.device.feed = feed;
+  // First contact, even a fault report, must not leave simulated values on screen.
+  if (state.sourceMode === 'auto' && state.source !== 'device') switchToDevice();
+  if (deviceStatus(receivedAt).stale) { state.lastDevicePush = 0; return; }
+  if (state.source === 'device' && state.latest && Number.isInteger(meter.sequence)
+      && state.latest.seq === meter.sequence) return;
   const sample = parseEsp32Sample(meter, receivedAt);
   if (sample) {
+    state.device.last_sample_at = receivedAt - Math.max(0, state.device.age_ms || 0);
     if (state.source === 'device') pushDeviceSample(sample);
     else if (state.sourceMode === 'auto') switchToDevice(sample); // first real sample
     // explicit 'simulation' mode: report status only, keep simulating
@@ -442,6 +580,36 @@ function serveStatic(req, res, pathname) {
   });
 }
 
+function deviceStatus(now = Date.now()) {
+  const d = state.device;
+  const age = d.last_seen === null ? null : Math.max(0, now - d.last_seen);
+  const connected = d.connected && age !== null && age < DEVICE_STALE_MS;
+  const reportedAge = d.age_ms === null ? null : Math.max(0, d.age_ms) + (age || 0);
+  const sequenceAge = d.last_sequence_at === null ? null : Math.max(0, now - d.last_sequence_at);
+  const sampleAge = reportedAge === null && sequenceAge === null ? null
+    : Math.max(reportedAge || 0, sequenceAge || 0);
+  let health = !connected
+    ? { code: age === null ? 'waiting' : 'esp32_offline', severity: 'error',
+      message: age === null ? 'Waiting for ESP32 data.'
+        : 'Communication lost with ESP32. Check its power, Wi-Fi and network connection.' }
+    : { code: 'ok', severity: 'ok', message: 'ESP32 connected; meter readings are live.' };
+  if (connected && d.adapter_connected === false) {
+    health = { code: 'adapter_disconnected', severity: 'error',
+      message: 'ESP32 is online, but it reports the RS-485 adapter disconnected. Check the adapter connection and power.' };
+  } else if (connected && d.meter_error) {
+    health = { code: 'meter_error', severity: 'error',
+      message: `ESP32 is online, but meter communication failed: ${d.meter_error}. Check RS-485 wiring, adapter and meter power.` };
+  } else if (connected && !d.has_sample) {
+    health = { code: 'meter_no_data', severity: 'warning',
+      message: 'ESP32 is online, but no meter sample is available. Check the RS-485 connection and meter power.' };
+  } else if (connected && (d.stale || sampleAge >= DEVICE_STALE_MS)) {
+    health = { code: 'meter_stale', severity: 'warning',
+      message: 'ESP32 is online, but meter readings are not updating. Check RS-485 wiring, adapter and meter power.' };
+  }
+  return { ...d, connected, stale: health.code !== 'ok',
+    last_seen_age_ms: age, sample_age_ms: sampleAge, timeout_ms: DEVICE_STALE_MS, health };
+}
+
 function readingsPayload() {
   return {
     source: state.source,
@@ -453,7 +621,8 @@ function readingsPayload() {
       esp32_url: ESP32_URL,
       sim: { ...state.sim },
       buffers: { sec: state.sec.length, min: state.min.length },
-      device: state.device,
+      device: deviceStatus(),
+      db: dbStats(),
     },
   };
 }
@@ -527,10 +696,76 @@ async function handleIngest(req, res, body) {
   state.device.last_seen = Date.now();
   state.device.last_error = null;
   state.device.stale = false;
+  state.device.has_sample = true;
+  state.device.adapter_connected = null; // legacy payload has no adapter diagnostics
+  state.device.meter_error = null;
+  state.device.age_ms = 0;
+  state.device.sequence = s.seq;
+  state.device.last_sequence_at = state.device.last_seen;
+  state.device.last_sample_at = state.device.last_seen;
   state.device.feed = 'push';
   if (state.source !== 'device') switchToDevice(s);
   else pushSample(s);
   sendJSON(res, 200, { ok: true, feed: 'push', buffered: { sec: state.sec.length, min: state.min.length } });
+}
+
+const EXPORT_RANGE_MS = {
+  live: 10 * 60e3, '1h': 3600e3, '6h': 6 * 3600e3,
+  '24h': 24 * 3600e3, '7d': 7 * 24 * 3600e3, all: Infinity,
+};
+
+function handleExport(res, url) {
+  if (!db) return sendJSON(res, 503, { error: 'database unavailable' });
+  const range = EXPORT_RANGE_MS[url.searchParams.get('range')] !== undefined
+    ? url.searchParams.get('range') : '1h';
+  let group = url.searchParams.get('group') || 'auto';
+  if (group === 'auto') {
+    group = ['live', '1h', '6h'].includes(range) ? 'raw' : range === '24h' ? 'minute' : 'hour';
+  }
+  if (!['raw', 'minute', 'hour'].includes(group)) {
+    return sendJSON(res, 400, { error: 'group must be raw | minute | hour | auto' });
+  }
+  const cutoff = EXPORT_RANGE_MS[range] === Infinity ? 0 : Date.now() - EXPORT_RANGE_MS[range];
+  let rows;
+  try {
+    if (group === 'raw') {
+      const { n } = db.prepare('SELECT COUNT(*) AS n FROM samples WHERE t >= ?').get(cutoff);
+      if (n > RAW_EXPORT_MAX_ROWS) {
+        return sendJSON(res, 400, {
+          error: `${n} raw samples in range (max ${RAW_EXPORT_MAX_ROWS}). Use group=minute or group=hour, or a smaller range.`,
+        });
+      }
+      rows = db.prepare('SELECT * FROM samples WHERE t >= ? ORDER BY t').all(cutoff);
+    } else {
+      const bucketMs = group === 'minute' ? 60000 : 3600e3;
+      const cols = SAMPLE_COLS.filter(c => c !== 't')
+        .map(c => `${aggExpr(c)} AS ${c}`).join(', ');
+      const sql = `SELECT (t / ${bucketMs}) * ${bucketMs} AS t, ${cols}
+                   FROM samples WHERE t >= ? GROUP BY 1 ORDER BY 1`;
+      rows = db.prepare(sql).all(cutoff);
+    }
+  } catch (err) {
+    return sendJSON(res, 500, { error: `export query failed: ${err.message}` });
+  }
+  if (!rows.length) return sendJSON(res, 200, 't\n', 'text/csv; charset=utf-8');
+
+  const header = ['t_iso', 't_ms', ...SAMPLE_COLS.slice(1)];
+  const lines = [header.join(',')];
+  for (const r of rows) {
+    const iso = new Date(r.t).toISOString();
+    lines.push([iso, r.t, ...SAMPLE_COLS.slice(1).map(c => {
+      const v = r[c];
+      return v === null || v === undefined ? '' : v;
+    })].join(','));
+  }
+  const stamp = new Date().toISOString().slice(0, 10);
+  res.writeHead(200, {
+    'Content-Type': 'text/csv; charset=utf-8',
+    'Content-Disposition': `attachment; filename="energymeter-${range}-${group}-${stamp}.csv"`,
+    'Cache-Control': 'no-store',
+    'Access-Control-Allow-Origin': '*',
+  });
+  res.end(lines.join('\n') + '\n');
 }
 
 const server = http.createServer(async (req, res) => {
@@ -547,18 +782,21 @@ const server = http.createServer(async (req, res) => {
         sim: { ...state.sim },
         buffers: { sec: state.sec.length, min: state.min.length },
         latest_seq: state.sequence,
-        device: state.device,
+        device: deviceStatus(),
+        db: dbStats(),
         ingest_endpoint: 'POST /api/ingest',
       });
     }
     if (req.method === 'GET' && p === '/api/readings') {
-      if (!state.latest) return sendJSON(res, 503, { error: 'no sample yet' });
       return sendJSON(res, 200, readingsPayload());
     }
     if (req.method === 'GET' && p === '/api/history') {
       const range = url.searchParams.get('range') || 'live';
       const h = historyFor(range);
       return sendJSON(res, 200, { range, unit: h.unit, generated_at: Date.now(), points: h.points });
+    }
+    if (req.method === 'GET' && p === '/api/export') {
+      return handleExport(res, url);
     }
     if (req.method === 'POST' && p === '/api/source') {
       return handleSource(res, await readBody(req, MAX_BODY));
@@ -579,21 +817,19 @@ const server = http.createServer(async (req, res) => {
 });
 
 setInterval(tick, SIM_INTERVAL_MS);
+openDatabase();
+loadHistoryFromDb();
 tick(); // first sample immediately so the UI never sees an empty state
+applyRetention();
+setInterval(applyRetention, 24 * 3600e3);
 if (ESP32_URL) {
   setInterval(pollEsp32, ESP32_POLL_MS);
   pollEsp32();
 } else {
   console.log('  source:  pull disabled (ESP32_URL empty) — push mode via POST /api/ingest');
 }
-// Push-mode watchdog: if the ESP32 stops pushing (link down, no WiFi, crash),
-// mark readings stale instead of leaving "connected" with frozen values.
-setInterval(() => {
-  if (state.device.feed === 'push' && state.source === 'device'
-      && state.device.last_seen && Date.now() - state.device.last_seen > 15000) {
-    state.device.stale = true;
-  }
-}, 5000);
+// Communication health is evaluated on every status/readings request, so
+// timeouts apply to both feeds without waiting for a separate watchdog tick.
 
 server.listen(PORT, HOST, () => {
   const ifaces = os.networkInterfaces();

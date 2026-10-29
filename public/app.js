@@ -56,6 +56,10 @@
     const h = Math.floor(ms / 3600e3), m = Math.floor(ms % 3600e3 / 60e3);
     return `${h}h ${m}m`;
   }
+  const fmtBytes = b => b == null ? '—'
+    : b < 1024 ? `${b} B`
+    : b < 1048576 ? `${(b / 1024).toFixed(1)} KB`
+    : `${(b / 1048576).toFixed(1)} MB`;
   function hexToRgba(hex, alpha) {
     const h = hex.replace('#', '');
     const v = h.length === 3 ? h.split('').map(c => c + c).join('') : h;
@@ -710,29 +714,58 @@
     if (!force && !liveRange && Date.now() - S.lastHistoryFetch < 15000) return;
     S.lastHistoryFetch = Date.now();
     try {
-      const res = await fetch(`/api/history?range=${S.range}`, { cache: 'no-store' });
+      const res = await fetch(`/api/history?range=${S.range}`, { cache: 'no-store', signal: AbortSignal.timeout(5000) });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
-      if (!Array.isArray(data.points) || !data.points.length) return;
+      if (!Array.isArray(data.points)) return;
       S.lastHistory = data.points;
-      S.lastHistorySpan = data.points[data.points.length - 1].t - data.points[0].t || 600e3;
+      S.lastHistorySpan = data.points.length ? data.points[data.points.length - 1].t - data.points[0].t || 600e3 : 600e3;
       updateCharts(data.points);
     } catch { /* banner handled by readings poll */ }
   }
 
   // ---------------------------------------------------------------- readings poll
 
+  function clearMeasurements() {
+    S.latest = null;
+    S.lastHistory = [];
+    for (const ring of Object.values(S.rings)) ring.length = 0;
+    for (const { chart } of sparkCharts.values()) {
+      chart.data.datasets[0].data = [];
+      chart.update('none');
+    }
+    updateCharts([]);
+    if (donut) {
+      donut.data.datasets[0].data = [];
+      donut.$center = '—';
+      donut.update('none');
+    }
+    for (const el of document.querySelectorAll('.kpi-value, .kpi-delta, .sys-value, td.ph, .stat-value, .stat-meta, .donut-legend .val')) {
+      el.textContent = '—';
+    }
+    $('balanceRows').textContent = 'No valid meter sample yet.';
+    $('sysSeq').textContent = '—';
+    $('tableStamp').textContent = 'No valid meter sample yet';
+  }
+
   async function pollReadings() {
     try {
-      const res = await fetch('/api/readings', { cache: 'no-store', headers: { Accept: 'application/json' } });
+      const res = await fetch('/api/readings', { cache: 'no-store', signal: AbortSignal.timeout(5000), headers: { Accept: 'application/json' } });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
-      if (!data.sample || !data.sample.tot) throw new Error('invalid readings response');
-      S.latest = data.sample;
+      if (!data.meta || (data.sample !== null && !data.sample?.tot)) throw new Error('invalid readings response');
+      const previous = S.latest;
       S.meta = data.meta;
       S.online = true;
-      hideNotice();
-      updateKpis(data.sample);
+      if (!S.paused) hideNotice();
+      if (data.sample === null) {
+        if (!S.paused) clearMeasurements();
+        updateSourcePills(data);
+        return;
+      }
+      if (S.paused) { updateSourcePills(data); return; }
+      S.latest = data.sample;
+      if (!previous || previous.t !== data.sample.t || previous.seq !== data.sample.seq) updateKpis(data.sample);
       updateDonut(data.sample);
       updateSystem(data.sample, data.meta);
       updateTable(data.sample);
@@ -743,6 +776,10 @@
       updateSourcePills(data);
     } catch (err) {
       S.online = false;
+      $('sourcePill').textContent = 'Server offline';
+      $('sourcePill').className = 'pill bad';
+      $('sideDot').className = 'dot bad';
+      $('sideSource').textContent = 'Server offline';
       showNotice(`Unable to reach the server API (${err.message || 'network error'}). Last known values remain visible; retrying automatically.`);
     }
   }
@@ -758,17 +795,29 @@
     let pillText, pillCls, dotCls, sideText, bannerMsg = null, bannerKind = 'info';
 
     if (source === 'device') {
-      if (!dev || !dev.connected) {
-        pillText = 'Device offline'; pillCls = 'pill bad'; dotCls = 'dot bad';
-        bannerMsg = `Cannot reach the ESP32 (${dev && dev.last_error ? dev.last_error : 'network error'}). Showing last known values.`;
+      const health = dev && dev.health;
+      const labels = { waiting: 'Waiting for ESP32', esp32_offline: 'ESP32 offline',
+        adapter_disconnected: 'RS-485 disconnected', meter_error: 'Meter error',
+        meter_no_data: 'No meter data', meter_stale: 'Meter stale' };
+      if (health && health.code !== 'ok') {
+        pillText = labels[health.code] || 'Device fault';
+        const error = health.severity === 'error';
+        pillCls = error ? 'pill bad' : 'pill warn';
+        dotCls = error ? 'dot bad' : 'dot warn';
+        bannerKind = error ? 'error' : 'info';
+        bannerMsg = health.message + (data.sample
+          ? ` Showing last known values from ${fmtClock(data.sample.t)}; not live.`
+          : ' No valid meter sample yet.');
+      } else if (!dev || !dev.connected || dev.stale) {
+        pillText = 'Device unavailable'; pillCls = 'pill bad'; dotCls = 'dot bad';
+        bannerMsg = 'Device readings unavailable. Displayed values are not live.';
         bannerKind = 'error';
-      } else if (dev.stale) {
-        pillText = 'Device stale'; pillCls = 'pill warn'; dotCls = 'dot warn';
-        bannerMsg = 'ESP32 readings are stale (meter or adapter issue). Showing last known values.';
       } else {
-        pillText = 'Device'; pillCls = 'pill good'; dotCls = 'dot ok pulse';
+        pillText = S.paused ? 'Display paused' : 'Device live';
+        pillCls = S.paused ? 'pill warn' : 'pill good';
+        dotCls = S.paused ? 'dot warn' : 'dot ok pulse';
       }
-      sideText = 'ESP32 device';
+      sideText = pillText;
       if (dev && dev.candidate_layout) {
         bannerMsg = (bannerMsg ? bannerMsg + ' ' : '') + 'Provisional register map — labels and units still need verification against the analyzer display.';
       }
@@ -780,6 +829,9 @@
         pillText = 'Paused'; pillCls = 'pill'; dotCls = 'dot warn';
         sideText = 'Simulator paused';
       }
+      if (mode === 'auto' && dev && dev.health && dev.health.code !== 'ok') {
+        bannerMsg = `${dev.health.message} Showing SIMULATED data, not meter measurements.`;
+      }
     }
     if (!S.online) { dotCls = 'dot bad'; }
 
@@ -787,7 +839,8 @@
     dot.className = dotCls;
     $('sideSource').textContent = sideText;
     if (bannerMsg) { showNotice(bannerMsg, bannerKind); S.deviceBanner = true; }
-    else if (S.deviceBanner && !S.paused) { hideNotice(); S.deviceBanner = false; }
+    else if (!S.paused) { hideNotice(); S.deviceBanner = false; }
+    if (S.paused && !(dev && dev.stale) && !bannerMsg) showNotice('Display paused. Connection monitoring remains active.', 'info');
     $('sideMeta').textContent = meta
       ? `seq #${S.latest ? S.latest.seq : '—'} · ${meta.buffers.sec} s + ${meta.buffers.min} min buffered`
       : '—';
@@ -796,6 +849,30 @@
       const modeSel = $('sourceMode');
       if (modeSel && mode && modeSel.value !== mode) modeSel.value = mode;
       if (meta.esp32_url) $('esp32UrlNote').textContent = meta.esp32_url;
+      // database panel
+      const dbInfo = meta.db;
+      if (dbInfo) {
+        $('dbPill').textContent = 'active';
+        $('dbPill').className = 'pill good';
+        $('dbPathNote').textContent = dbInfo.path;
+        const rows2 = [
+          ['Samples stored', Number(dbInfo.rows).toLocaleString()],
+          ['File size', fmtBytes(dbInfo.size_bytes)],
+          ['Oldest sample', dbInfo.oldest_t ? fmtClock(dbInfo.oldest_t) : '—'],
+          ['Newest sample', dbInfo.newest_t ? fmtClock(dbInfo.newest_t) : '—'],
+        ];
+        const el2 = $('dbRows');
+        el2.innerHTML = '';
+        for (const [k, v] of rows2) {
+          const row = document.createElement('div');
+          row.className = 'setting-row';
+          row.innerHTML = `<span class="k">${k}</span><span class="v mono">${v}</span>`;
+          el2.append(row);
+        }
+      } else {
+        $('dbPill').textContent = 'unavailable';
+        $('dbPill').className = 'pill bad';
+      }
     }
     const agoS = ms => (ms == null ? '—' : `${Math.max(0, Math.round((Date.now() - ms) / 1000))} s ago`);
     const rows = [
@@ -803,7 +880,12 @@
       ['Source mode', mode === 'auto' ? 'Auto' : mode === 'device' ? 'ESP32 only' : 'Simulator only'],
       ['Data flow', dev && dev.feed === 'push' ? 'ESP32 → server (push)' : 'server → ESP32 (pull)'],
       ['Latest sample', S.latest ? `#${S.latest.seq} · ${fmtClock(S.latest.t)}` : '—'],
-      ['ESP32 status', !dev ? '—' : !dev.connected ? `unreachable · ${dev.last_error || ''}` : dev.stale ? 'stale readings' : 'connected'],
+      ['ESP32 status', !dev ? '—' : dev.connected ? 'connected' : 'unreachable'],
+      ['Communication health', dev && dev.health ? dev.health.message : '—'],
+      ['Transport error', dev && dev.last_error ? dev.last_error : '—'],
+      ['Meter error', dev && dev.meter_error ? dev.meter_error : '—'],
+      ['Last valid meter sample', dev && dev.last_sample_at ? `${fmtClock(dev.last_sample_at)} (${agoS(dev.last_sample_at)})` : 'never'],
+      ['Meter sample age', dev && dev.sample_age_ms != null ? `${(dev.sample_age_ms / 1000).toFixed(1)} s` : '—'],
       ['ESP32 last seen', dev && dev.last_seen ? `${fmtClock(dev.last_seen)} (${agoS(dev.last_seen)})` : 'never'],
       ['Meter adapter', dev && dev.adapter_connected === true ? `connected · ${dev.baudrate || '?'} baud` : dev && dev.adapter_connected === false ? 'disconnected' : '—'],
       ['Meter device id', dev && dev.device_id != null ? `Device ${dev.device_id}` : '—'],
@@ -818,7 +900,11 @@
     for (const [k, v] of rows) {
       const row = document.createElement('div');
       row.className = 'setting-row';
-      row.innerHTML = `<span class="k">${k}</span><span class="v mono">${v}</span>`;
+      const key = document.createElement('span');
+      key.className = 'k'; key.textContent = k;
+      const value = document.createElement('span');
+      value.className = 'v mono'; value.textContent = v;
+      row.append(key, value);
       el.append(row);
     }
   }
@@ -826,10 +912,8 @@
   // ---------------------------------------------------------------- loop
 
   async function loop() {
-    if (!S.paused) {
-      await pollReadings();
-      await fetchHistory();
-    }
+    await pollReadings(); // Keep fault feedback active even when charts are paused.
+    if (!S.paused) await fetchHistory();
     S.timer = setTimeout(loop, S.pollMs);
   }
 
@@ -935,6 +1019,11 @@
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mode: e.target.value }),
       }).catch(() => {});
+    });
+    $('exportBtn').addEventListener('click', () => {
+      const range = $('exportRange').value;
+      const group = $('exportGroup').value;
+      window.location.href = `/api/export?range=${encodeURIComponent(range)}&group=${encodeURIComponent(group)}`;
     });
     $('pollInterval').addEventListener('change', e => {
       S.pollMs = Number(e.target.value) * 1000;

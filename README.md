@@ -65,8 +65,60 @@ selector (10 min live → 7 days), pause/resume live updates, dark/light theme
 ESP32 config via env: `ESP32_URL` (default `http://energymeter.local/api/readings`),
 `ESP32_POLL_MS` (default 2000), `ESP32_TIMEOUT_MS` (default 4000).
 
+## Database & CSV export
+
+Every sample (device and simulator) is stored in SQLite via Node's built-in
+`node:sqlite` — no external database service needed. File:
+`data/energymeter.db` (WAL mode, ~50 MB/year at 1 sample/s).
+
+- `DB_PATH` env overrides the file location.
+- `DB_RETENTION_DAYS` (default 0 = keep forever) prunes old samples daily.
+- On restart, the in-memory live buffers (2 h seconds + 7 d minute aggregates)
+  are reloaded from the database, so charts survive reboots.
+- CSV export: `GET /api/export?range=live|1h|6h|24h|7d|all&group=raw|minute|hour|auto`
+  (Settings → Database & export panel has the download button). Raw export is
+  capped at 100,000 rows — use minute/hour grouping for longer ranges.
+
 History: 1 s resolution kept for 2 h, 1 min aggregates kept for 7 days
-(in memory — persistence comes later).
+(in memory for the live UI; the database keeps everything long-term). Restarting resets history and integrated energy.
+
+## Communication feedback
+
+The dashboard shows a persistent warning and sidebar status for:
+
+- **ESP32 offline:** no valid payload received for 15 seconds, or a failed pull
+  when push is not active. Check ESP32 power, Wi-Fi and the network path.
+- **RS-485 disconnected:** the ESP32 explicitly reports `adapter_connected: false`.
+- **Meter error:** the ESP32 is reachable but reports `meter.last_error` (shown
+  verbatim as text, for example a Modbus timeout).
+- **No meter data:** the ESP32 reports `has_sample: false`.
+- **Meter stale:** the firmware reports `stale: true`, sample age reaches 15
+  seconds, or the meter sequence stops advancing for 15 seconds while messages
+  continue to arrive.
+- **Server offline:** the browser cannot reach the Node API (5-second request
+  timeout). This is distinct from an ESP32 or meter fault.
+
+Faults clear automatically on healthy data. The UI refreshes on its selected
+poll interval (2 seconds by default); health monitoring continues while charts
+are paused. Settings includes last contact, last valid meter sample, sample age,
+and separate transport/meter errors. Both `/api/status` and `/api/readings`
+include `device.health` (`code`, `severity`, `message`) and freshness metadata;
+`/api/readings` returns HTTP 200 with `sample: null` if no valid sample exists.
+
+Bad/stale samples and duplicate sequences do not enter history or accumulate
+energy. The last good values remain visible and labelled as not live. Integration
+skips known outages rather than estimating consumption across them. Auto mode
+stops simulating as soon as the first ESP32 report arrives, even a fault report.
+Before first contact, any simulated data is explicitly labelled.
+
+The server cannot prove a physical disconnection from a generic timeout alone.
+A specific adapter-disconnected message requires the firmware flag; otherwise
+it reports a meter communication fault and suggests checks. If using push-only
+firmware, send status payloads even when meter reads fail; if all messages stop,
+the server can only report loss of ESP32 contact. Set `ESP32_URL=''` to disable
+LAN polling; either successful transport counts as contact when both are active.
+
+Run regression tests with `npm test` (no additional dependencies).
 
 ## Phase 3 — register-map verification (next step)
 

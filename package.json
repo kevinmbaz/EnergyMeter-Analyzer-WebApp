@@ -5,7 +5,8 @@
   "description": "Three-phase energy analytics dashboard for the TPM-04-100D analyzer (ESP32-fed). GUI phase: built-in simulator.",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test test/*.test.js"
   },
   "engines": {
     "node": ">=18"
