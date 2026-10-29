@@ -1,0 +1,11 @@
+node_modules/
+.env
+.env.*
+*.local
+sdkconfig
+sdkconfig.*
+.DS_Store
+npm-debug.log*
+*.log
+.vscode/
+.idea/

@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0d1513">
+  <meta name="description" content="Three-phase energy analytics for the TPM-04-100D analyzer.">
+  <title>TPM-04-100D · Energy Analytics</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <aside class="sidebar" aria-label="Navigation">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">ϟ</div>
+      <div class="brand-text">
+        <p class="eyebrow">Energy analytics</p>
+        <h1>TPM-04-100D</h1>
+      </div>
+    </div>
+    <nav class="nav">
+      <button class="nav-item active" data-view="overview" type="button"><span class="nav-ico" aria-hidden="true">◧</span><span>Overview</span></button>
+      <button class="nav-item" data-view="power" type="button"><span class="nav-ico" aria-hidden="true">⚡</span><span>Power</span></button>
+      <button class="nav-item" data-view="voltage" type="button"><span class="nav-ico" aria-hidden="true">∿</span><span>Voltage</span></button>
+      <button class="nav-item" data-view="current" type="button"><span class="nav-ico" aria-hidden="true">⌁</span><span>Current</span></button>
+      <button class="nav-item" data-view="quality" type="button"><span class="nav-ico" aria-hidden="true">◉</span><span>Power quality</span></button>
+      <button class="nav-item" data-view="energy" type="button"><span class="nav-ico" aria-hidden="true">Σ</span><span>Energy</span></button>
+      <button class="nav-item" data-view="table" type="button"><span class="nav-ico" aria-hidden="true">≣</span><span>Live data</span></button>
+      <button class="nav-item" data-view="settings" type="button"><span class="nav-ico" aria-hidden="true">⚙</span><span>Settings</span></button>
+    </nav>
+    <div class="side-status">
+      <div class="side-status-row"><span class="dot" id="sideDot"></span><span id="sideSource">Starting…</span></div>
+      <div class="side-status-meta" id="sideMeta">—</div>
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <div class="topbar-title">
+        <h2 id="viewTitle">Overview</h2>
+        <p id="viewSubtitle">Three-phase measurements · TPM-04-100D</p>
+      </div>
+      <div class="topbar-controls">
+        <label class="range-wrap" id="rangeWrap">
+          <span class="sr-only">Time range</span>
+          <select id="rangeSelect" aria-label="Chart time range">
+            <option value="live">Live · 10 min</option>
+            <option value="1h">1 hour</option>
+            <option value="6h">6 hours</option>
+            <option value="24h">24 hours</option>
+            <option value="7d">7 days</option>
+          </select>
+        </label>
+        <div class="chips" id="phaseChips" aria-label="Phase visibility">
+          <button class="chip chip-l1 active" data-phase="l1" type="button"><i></i>L1</button>
+          <button class="chip chip-l2 active" data-phase="l2" type="button"><i></i>L2</button>
+          <button class="chip chip-l3 active" data-phase="l3" type="button"><i></i>L3</button>
+          <button class="chip chip-total active" data-phase="total" type="button"><i></i>Total</button>
+        </div>
+        <button class="icon-btn" id="pauseBtn" type="button" title="Pause live updates" aria-pressed="false">❚❚</button>
+        <span class="clock mono" id="clock" aria-label="Current time">--:--:--</span>
+        <button class="icon-btn" id="themeBtn" type="button" title="Toggle light / dark theme">◐</button>
+      </div>
+    </header>
+
+    <div class="notice" id="notice" role="status" aria-live="polite" hidden><span class="notice-icon" aria-hidden="true">!</span><p id="noticeText"></p></div>
+
+    <main id="views">
+
+      <!-- ============ OVERVIEW ============ -->
+      <section class="view active" data-view="overview">
+        <div class="kpi-grid" id="kpiGrid">
+          <article class="kpi"><div class="kpi-head"><span>Total active power</span><span class="unit">kW</span></div><div class="kpi-value" id="kpiPower">—</div><div class="kpi-delta" id="kpiPowerDelta"></div><div class="spark-wrap"><canvas id="sparkPower"></canvas></div></article>
+          <article class="kpi"><div class="kpi-head"><span>Energy since start</span><span class="unit">kWh</span></div><div class="kpi-value" id="kpiEnergy">—</div><div class="kpi-delta" id="kpiEnergyDelta"></div><div class="spark-wrap"><canvas id="sparkEnergy"></canvas></div></article>
+          <article class="kpi"><div class="kpi-head"><span>Power factor</span><span class="unit">avg</span></div><div class="kpi-value" id="kpiPf">—</div><div class="kpi-delta" id="kpiPfDelta"></div><div class="spark-wrap"><canvas id="sparkPf"></canvas></div></article>
+          <article class="kpi"><div class="kpi-head"><span>Frequency</span><span class="unit">Hz</span></div><div class="kpi-value" id="kpiFreq">—</div><div class="kpi-delta" id="kpiFreqDelta"></div><div class="spark-wrap"><canvas id="sparkFreq"></canvas></div></article>
+          <article class="kpi"><div class="kpi-head"><span>Total current</span><span class="unit">A</span></div><div class="kpi-value" id="kpiCurrent">—</div><div class="kpi-delta" id="kpiCurrentDelta"></div><div class="spark-wrap"><canvas id="sparkCurrent"></canvas></div></article>
+          <article class="kpi"><div class="kpi-head"><span>Phase imbalance</span><span class="unit">%</span></div><div class="kpi-value" id="kpiImbalance">—</div><div class="kpi-delta" id="kpiImbalanceDelta"></div><div class="spark-wrap"><canvas id="sparkImbalance"></canvas></div></article>
+        </div>
+        <div class="overview-grid">
+          <article class="panel panel-chart">
+            <div class="panel-head"><div><h3>Active power by phase</h3><p class="panel-sub" id="powerChartSub">W</p></div><div class="panel-legend" id="powerChartLegend"></div></div>
+            <div class="chart-box chart-lg"><canvas id="overviewPowerChart"></canvas></div>
+          </article>
+          <div class="overview-side">
+            <article class="panel">
+              <div class="panel-head"><h3>Energy share</h3><span class="panel-hint">since server start</span></div>
+              <div class="chart-box chart-md"><canvas id="energyDonut"></canvas></div>
+              <div class="donut-legend" id="donutLegend"></div>
+            </article>
+            <article class="panel">
+              <div class="panel-head"><h3>System</h3><span class="panel-hint mono" id="sysSeq">—</span></div>
+              <div class="sys-rows" id="sysRows"></div>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ POWER ============ -->
+      <section class="view" data-view="power">
+        <div class="stat-grid" id="powerStats"></div>
+        <article class="panel panel-chart">
+          <div class="panel-head"><div><h3>Active power</h3><p class="panel-sub">per phase · stacked</p></div></div>
+          <div class="chart-box chart-lg"><canvas id="powerPChart"></canvas></div>
+        </article>
+        <div class="two-col">
+          <article class="panel panel-chart">
+            <div class="panel-head"><div><h3>Reactive power</h3><p class="panel-sub">var</p></div></div>
+            <div class="chart-box chart-md"><canvas id="powerQChart"></canvas></div>
+          </article>
+          <article class="panel panel-chart">
+            <div class="panel-head"><div><h3>Apparent power</h3><p class="panel-sub">VA</p></div></div>
+            <div class="chart-box chart-md"><canvas id="powerSChart"></canvas></div>
+          </article>
+        </div>
+        <article class="panel panel-chart">
+          <div class="panel-head"><div><h3>Power demand</h3><p class="panel-sub">rolling demand per phase · W</p></div></div>
+          <div class="chart-box chart-md"><canvas id="powerDChart"></canvas></div>
+        </article>
+      </section>
+
+      <!-- ============ VOLTAGE ============ -->
+      <section class="view" data-view="voltage">
+        <div class="stat-grid" id="voltageStats"></div>
+        <div class="two-col">
+          <article class="panel panel-chart">
+            <div class="panel-head"><div><h3>Phase to neutral</h3><p class="panel-sub">V</p></div></div>
+            <div class="chart-box chart-md"><canvas id="voltageLnChart"></canvas></div>
+          </article>
+          <article class="panel panel-chart">
+            <div class="panel-head"><div><h3>Phase to phase</h3><p class="panel-sub">V</p></div></div>
+            <div class="chart-box chart-md"><canvas id="voltageLlChart"></canvas></div>
+          </article>
+        </div>
+      </section>
+
+      <!-- ============ CURRENT ============ -->
+      <section class="view" data-view="current">
+        <div class="stat-grid" id="currentStats"></div>
+        <div class="two-col">
+          <article class="panel panel-chart">
+            <div class="panel-head"><div><h3>Line currents</h3><p class="panel-sub">A</p></div></div>
+            <div class="chart-box chart-md"><canvas id="currentChart"></canvas></div>
+          </article>
+          <article class="panel panel-chart">
+            <div class="panel-head"><div><h3>Current demand</h3><p class="panel-sub">A · rolling demand</p></div></div>
+            <div class="chart-box chart-md"><canvas id="currentDChart"></canvas></div>
+          </article>
+        </div>
+      </section>
+
+      <!-- ============ QUALITY ============ -->
+      <section class="view" data-view="quality">
+        <div class="two-col">
+          <article class="panel panel-chart">
+            <div class="panel-head"><div><h3>Power factor</h3><p class="panel-sub">per phase</p></div></div>
+            <div class="chart-box chart-md"><canvas id="pfChart"></canvas></div>
+          </article>
+          <article class="panel panel-chart">
+            <div class="panel-head"><div><h3>Frequency</h3><p class="panel-sub">Hz · grid stability</p></div></div>
+            <div class="chart-box chart-md"><canvas id="freqChart"></canvas></div>
+          </article>
+        </div>
+        <div class="two-col">
+          <article class="panel">
+            <div class="panel-head"><h3>Phase balance</h3><span class="panel-hint">active power spread</span></div>
+            <div class="balance-rows" id="balanceRows"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-head"><h3>Notes</h3></div>
+            <ul class="note-list">
+              <li>Power factor, cos φ and frequency come from the analyzer's register map and remain provisional until verified against the TPM-04-100D display.</li>
+              <li>Balance is computed from the three phase power readings: max deviation from the mean, as a percentage of the mean.</li>
+              <li>With no voltage inputs connected the analyzer may report 0 V / 0 Hz — values would then read as unavailable on this dashboard too.</li>
+            </ul>
+          </article>
+        </div>
+      </section>
+
+      <!-- ============ ENERGY ============ -->
+      <section class="view" data-view="energy">
+        <div class="stat-grid" id="energyStats"></div>
+        <article class="panel panel-chart">
+          <div class="panel-head">
+            <div><h3 id="energyChartTitle">Energy per hour</h3><p class="panel-sub" id="energyChartSub">kWh</p></div>
+            <div class="panel-actions">
+              <button class="btn" id="csvEnergy" type="button">Export energy CSV</button>
+              <button class="btn" id="csvPower" type="button">Export power CSV</button>
+            </div>
+          </div>
+          <div class="chart-box chart-lg"><canvas id="energyBarChart"></canvas></div>
+        </article>
+      </section>
+
+      <!-- ============ LIVE TABLE ============ -->
+      <section class="view" data-view="table">
+        <div class="table-card">
+          <div class="panel-head table-head">
+            <div><h3>All measurement groups</h3><p class="panel-sub">live values by phase · updated every poll</p></div>
+            <span class="panel-hint mono" id="tableStamp">—</span>
+          </div>
+          <div class="table-scroll">
+            <table>
+              <thead><tr><th scope="col">Measurement</th><th scope="col" class="ph">L1</th><th scope="col" class="ph">L2</th><th scope="col" class="ph">L3</th><th scope="col">Unit</th></tr></thead>
+              <tbody id="liveTableBody"></tbody>
+            </table>
+          </div>
+          <p class="table-note">Units are assigned by this server. Register addresses, phase order and scaling still need verification against the analyzer display (step 2 — ESP32 integration).</p>
+        </div>
+      </section>
+
+      <!-- ============ SETTINGS ============ -->
+      <section class="view" data-view="settings">
+        <div class="settings-grid">
+          <article class="panel">
+            <div class="panel-head"><h3>Data source</h3><span class="pill" id="sourcePill">—</span></div>
+            <label class="slider-row">
+              <span>Source mode</span>
+              <select id="sourceMode" class="select" aria-label="Data source mode">
+                <option value="auto">Auto — ESP32, simulator fallback</option>
+                <option value="device">ESP32 only</option>
+                <option value="simulation">Simulator only</option>
+              </select>
+            </label>
+            <div class="setting-rows" id="sourceRows"></div>
+            <p class="setting-note">The server polls <code id="esp32UrlNote">http://energymeter.local/api/readings</code> every 2 seconds (no ESP32 firmware change needed). Energy counters are integrated server-side from active power until the meter's energy registers are decoded.</p>
+          </article>
+          <article class="panel">
+            <div class="panel-head"><h3>Simulator</h3><span class="pill warn">dev tool</span></div>
+            <label class="switch-row">
+              <span>Running</span>
+              <input type="checkbox" id="simRunning" checked>
+              <span class="switch" aria-hidden="true"></span>
+            </label>
+            <label class="slider-row">
+              <span>Base load multiplier <output class="mono" id="multOut">1.00×</output></span>
+              <input type="range" id="simMultiplier" min="0" max="2" step="0.05" value="1">
+            </label>
+            <label class="slider-row">
+              <span>Noise <output class="mono" id="noiseOut">1.0</output></span>
+              <input type="range" id="simNoise" min="0" max="2" step="0.1" value="1">
+            </label>
+            <button class="btn" id="spikeBtn" type="button">Inject 30 s load spike</button>
+          </article>
+          <article class="panel">
+            <div class="panel-head"><h3>Appearance & polling</h3></div>
+            <label class="switch-row">
+              <span>Dark theme</span>
+              <input type="checkbox" id="darkToggle" checked>
+              <span class="switch" aria-hidden="true"></span>
+            </label>
+            <label class="slider-row">
+              <span>Poll interval <output class="mono" id="pollOut">2 s</output></span>
+              <input type="range" id="pollInterval" min="1" max="10" step="1" value="2">
+            </label>
+          </article>
+          <article class="panel">
+            <div class="panel-head"><h3>About</h3></div>
+            <ul class="note-list">
+              <li><strong>Server:</strong> plain Node.js, no dependencies. Static assets (Chart.js, Inter font) are vendored — works fully offline on the LAN.</li>
+              <li><strong>History:</strong> 1 s resolution for 2 hours, 1 min aggregates for 7 days, kept in memory.</li>
+              <li><strong>Device:</strong> TPM-04-100D three-phase analyzer, read by an ESP32 over Modbus RTU (USB / RS-485).</li>
+              <li><strong>Roadmap:</strong> 1) GUI (this build) → 2) ESP32 data ingestion → 3) register-map verification → 4) persistence + alerts.</li>
+            </ul>
+          </article>
+        </div>
+      </section>
+
+    </main>
+    <footer class="footer">
+      <p>Read-only monitoring · simulated data until the ESP32 is connected</p>
+      <p id="footerInfo">—</p>
+    </footer>
+  </div>
+
+  <script src="/vendor/chart.umd.min.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

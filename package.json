@@ -1,0 +1,14 @@
+{
+  "name": "tpm04-energy-analytics",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Three-phase energy analytics dashboard for the TPM-04-100D analyzer (ESP32-fed). GUI phase: built-in simulator.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}

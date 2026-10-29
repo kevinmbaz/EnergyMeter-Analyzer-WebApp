@@ -1,0 +1,1004 @@
+'use strict';
+
+/* TPM-04-100D Energy Analytics — client app.
+   GUI phase: consumes /api/readings + /api/history from the Node server
+   (currently fed by the built-in simulator; ESP32 comes in phase 2). */
+
+(() => {
+  const $ = id => document.getElementById(id);
+  const cssVar = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  const clamp = (x, lo, hi) => Math.min(hi, Math.max(lo, x));
+
+  const PHASES = ['l1', 'l2', 'l3'];
+  const PHASE_COLOR_KEY = { l1: '--p1', l2: '--p2', l3: '--p3', total: '--muted', accent: '--accent' };
+
+  const S = {
+    theme: localStorage.getItem('emTheme') || 'dark',
+    pollMs: Number(localStorage.getItem('emPollMs')) || 2000,
+    range: 'live',
+    paused: false,
+    online: false,
+    latest: null,
+    meta: null,
+    view: 'overview',
+    phasesOn: { l1: true, l2: true, l3: true, total: true },
+    provisionalShown: false,
+    deviceBanner: false,
+    rings: { power: [], energy: [], pf: [], freq: [], current: [], imbalance: [] },
+    chartSpecs: [],          // {chart, series:[{phase,key,colorKey,label,...}]}
+    lastHistory: null,
+    lastHistoryFetch: 0,
+    timer: null,
+    noticeTimer: null,
+  };
+
+  // ---------------------------------------------------------------- formatting
+
+  const nf = (min, max) => new Intl.NumberFormat(undefined, { minimumFractionDigits: min, maximumFractionDigits: max });
+  const fmt = { kW: nf(2, 2), V: nf(1, 1), A: nf(2, 2), W: nf(0, 0), pf: nf(3, 3), Hz: nf(2, 2), pct: nf(1, 1) };
+  const fmtKw = v => fmt.kW.format(v / 1000);
+  const fmtKwh = v => (v / 1000 < 10 ? nf(3, 3) : nf(2, 2)).format(v / 1000);
+  const fmtKvar = v => fmt.kW.format(v / 1000);
+  const fmtKva = v => fmt.kW.format(v / 1000);
+
+  function fmtAxisTime(t, spanMs) {
+    const d = new Date(t);
+    const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+    if (spanMs <= 2 * 3600e3) return `${hm}:${String(d.getSeconds()).padStart(2, '0')}`;
+    if (spanMs <= 30 * 3600e3) return hm;
+    return `${d.toLocaleDateString(undefined, { weekday: 'short' })} ${hm}`;
+  }
+  function fmtClock(t) {
+    const d = new Date(t);
+    return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')}`;
+  }
+  function fmtUptime(ms) {
+    const h = Math.floor(ms / 3600e3), m = Math.floor(ms % 3600e3 / 60e3);
+    return `${h}h ${m}m`;
+  }
+  function hexToRgba(hex, alpha) {
+    const h = hex.replace('#', '');
+    const v = h.length === 3 ? h.split('').map(c => c + c).join('') : h;
+    const n = parseInt(v, 16);
+    return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${alpha})`;
+  }
+  const finite = v => typeof v === 'number' && Number.isFinite(v);
+
+  // ---------------------------------------------------------------- chart engine
+
+  const chartPalette = () => ({
+    p1: cssVar('--p1'), p2: cssVar('--p2'), p3: cssVar('--p3'),
+    accent: cssVar('--accent'), muted: cssVar('--muted'), faint: cssVar('--faint'),
+    line: cssVar('--line'), ink: cssVar('--ink'), panel: cssVar('--panel'),
+  });
+
+  function baseChartOptions() {
+    const c = chartPalette();
+    return {
+      maintainAspectRatio: false,
+      animation: { duration: 350 },
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: c.panel, titleColor: c.ink, bodyColor: c.muted,
+          borderColor: c.line, borderWidth: 1, padding: 10, cornerRadius: 8,
+          titleFont: { weight: '600', size: 11.5 }, bodyFont: { size: 12 },
+          callbacks: {
+            title: items => items.length ? fmtAxisTime(items[0].parsed.x, S.lastHistorySpan || 600e3) : '',
+            label: ctx => ` ${ctx.dataset.label}: ${ctx.dataset.unitFmt ? ctx.dataset.unitFmt(ctx.parsed.y) : ctx.parsed.y}`,
+          },
+        },
+      },
+      scales: {
+        x: {
+          type: 'linear',
+          ticks: { color: c.faint, maxTicksLimit: 7, maxRotation: 0, font: { size: 10.5 }, callback(v) { return fmtAxisTime(v, S.lastHistorySpan || 600e3); } },
+          grid: { color: c.line, drawBorder: false },
+        },
+        y: {
+          ticks: { color: c.faint, font: { size: 10.5 } },
+          grid: { color: c.line, drawBorder: false },
+          border: { display: false },
+        },
+      },
+    };
+  }
+
+  function seriesDs(phase, colorKey, label, unitFmt, opts = {}) {
+    const c = chartPalette();
+    const color = c[colorKey] || c.accent;
+    return {
+      label, unitFmt,
+      data: [],
+      borderColor: color,
+      backgroundColor: opts.fill ? hexToRgba(color, opts.fillAlpha ?? 0.1) : color,
+      borderWidth: opts.dashed ? 1.5 : 2,
+      borderDash: opts.dashed ? [6, 4] : undefined,
+      pointRadius: 0, pointHitRadius: 8, pointHoverRadius: 3,
+      fill: opts.fill ? 'origin' : false,
+      tension: 0.35, cubicInterpolationMode: 'monotone',
+      stack: opts.stack, spanGaps: true,
+      phaseMeta: phase,
+    };
+  }
+
+  function pick(p, phase, key) {
+    return phase === 'total' ? p.tot[key] : p[phase][key];
+  }
+
+  function makeChart(id, series, extraOptions = {}) {
+    const el = $(id);
+    if (!el) return null;
+    const opts = baseChartOptions();
+    Object.assign(opts.scales, extraOptions.scales || {});
+    Object.assign(opts.plugins, extraOptions.plugins || {});
+    opts.animation = { duration: extraOptions.noAnim ? 0 : 350 };
+    const chart = new Chart(el, { type: extraOptions.type || 'line', data: { datasets: series.map(s => ({ ...s })) }, options: opts });
+    const spec = { chart, series: series.map(s => ({ phase: s.phaseMeta, colorKey: s.colorKey, fill: !!s.fill })) };
+    S.chartSpecs.push(spec);
+    return chart;
+  }
+
+  function updateChart(chart, series, points) {
+    series.forEach((s, i) => {
+      const ds = chart.data.datasets[i];
+      ds.data = points.map(p => ({ x: p.t, y: pick(p, s.phase, s.key) }));
+    });
+    chart.update('none');
+  }
+
+  function applyTheme() {
+    const c = chartPalette();
+    for (const { chart, series } of S.chartSpecs) {
+      chart.data.datasets.forEach((ds, i) => {
+        const s = series[i];
+        const color = c[s.colorKey] || c.accent;
+        ds.borderColor = color;
+        if (s.fill) ds.backgroundColor = hexToRgba(color, 0.1);
+      });
+      const o = chart.options;
+      o.plugins.tooltip.backgroundColor = c.panel;
+      o.plugins.tooltip.titleColor = c.ink;
+      o.plugins.tooltip.bodyColor = c.muted;
+      o.plugins.tooltip.borderColor = c.line;
+      for (const axis of ['x', 'y']) {
+        if (!o.scales[axis]) continue;
+        o.scales[axis].ticks.color = c.faint;
+        o.scales[axis].grid.color = c.line;
+        if (o.scales[axis].title) o.scales[axis].title.color = c.faint;
+      }
+      chart.update('none');
+    }
+    // donut + sparklines are registered separately
+    if (donut) {
+      donut.data.datasets[0].backgroundColor = [c.p1, c.p2, c.p3];
+      donut.options.plugins.tooltip.backgroundColor = c.panel;
+      donut.options.plugins.tooltip.titleColor = c.ink;
+      donut.options.plugins.tooltip.bodyColor = c.muted;
+      donut.options.plugins.tooltip.borderColor = c.line;
+      donut.update('none');
+    }
+    for (const { chart, spec } of sparkCharts.values()) {
+      const color = cssVar(spec.colorKey);
+      chart.data.datasets[0].borderColor = color;
+      chart.data.datasets[0].backgroundColor = hexToRgba(color, 0.12);
+      chart.update('none');
+    }
+  }
+
+  // ---------------------------------------------------------------- notice
+
+  function showNotice(text, kind = 'error') {
+    $('noticeText').textContent = text;
+    const n = $('notice');
+    n.hidden = false;
+    n.style.setProperty('--amber', kind === 'error' ? cssVar('--red') : cssVar('--amber'));
+    clearTimeout(S.noticeTimer);
+  }
+  function hideNotice() { $('notice').hidden = true; }
+
+  // ---------------------------------------------------------------- KPI cards
+
+  const sparkSpecs = [
+    { id: 'sparkPower', ring: 'power', colorKey: '--accent' },
+    { id: 'sparkEnergy', ring: 'energy', colorKey: '--accent' },
+    { id: 'sparkPf', ring: 'pf', colorKey: '--p2' },
+    { id: 'sparkFreq', ring: 'freq', colorKey: '--p3' },
+    { id: 'sparkCurrent', ring: 'current', colorKey: '--p1' },
+    { id: 'sparkImbalance', ring: 'imbalance', colorKey: '--p3' },
+  ];
+  const sparkCharts = new Map();
+
+  function buildSparks() {
+    for (const s of sparkSpecs) {
+      const el = $(s.id);
+      const color = cssVar(s.colorKey);
+      const chart = new Chart(el, {
+        type: 'line',
+        data: { datasets: [{ data: [], borderColor: color, backgroundColor: hexToRgba(color, 0.12), borderWidth: 1.5, pointRadius: 0, tension: 0.4, fill: true }] },
+        options: {
+          responsive: true, maintainAspectRatio: false, animation: false, events: [],
+          plugins: { legend: { display: false }, tooltip: { enabled: false } },
+          scales: { x: { display: false }, y: { display: false } },
+        },
+      });
+      sparkCharts.set(s.ring, { chart, spec: s });
+    }
+  }
+
+  function deltaSince(ring, ms) {
+    const now = Date.now();
+    const base = ring.find(e => e.t >= now - ms);
+    if (!base || base === ring[ring.length - 1]) return null;
+    return ring[ring.length - 1].v - base.v;
+  }
+  function setDelta(id, delta, unit) {
+    const el = $(id);
+    if (delta === null || !finite(delta)) { el.textContent = ''; el.className = 'kpi-delta'; return; }
+    const up = delta > 0.0001;
+    el.textContent = `${up ? '▲' : delta < -0.0001 ? '▼' : '•'} ${up ? '+' : ''}${unit(delta)} vs 1 min ago`;
+    el.className = `kpi-delta ${up ? 'up' : delta < -0.0001 ? 'down' : ''}`;
+  }
+
+  function pushRing(ring, v) {
+    S.rings[ring].push({ t: Date.now(), v });
+    if (S.rings[ring].length > 180) S.rings[ring].shift();
+  }
+
+  function updateKpis(s) {
+    const tot = s.tot;
+    pushRing('power', tot.p); pushRing('energy', tot.e_wh); pushRing('pf', tot.pf);
+    pushRing('freq', s.freq); pushRing('current', tot.i); pushRing('imbalance', tot.imbalance_p);
+
+    $('kpiPower').textContent = finite(tot.p) ? fmtKw(tot.p) : '—';
+    $('kpiEnergy').textContent = finite(tot.e_wh) ? fmtKwh(tot.e_wh) : '—';
+    $('kpiPf').textContent = finite(tot.pf) ? fmt.pf.format(tot.pf) : '—';
+    $('kpiFreq').textContent = finite(s.freq) ? fmt.Hz.format(s.freq) : '—';
+    $('kpiCurrent').textContent = finite(tot.i) ? fmt.A.format(tot.i) : '—';
+    $('kpiImbalance').textContent = finite(tot.imbalance_p) ? fmt.pct.format(tot.imbalance_p) : '—';
+
+    setDelta('kpiPowerDelta', deltaSince(S.rings.power, 60e3), v => `${fmtKw(v)} kW`);
+    setDelta('kpiEnergyDelta', deltaSince(S.rings.energy, 60e3), v => `${fmtKwh(v)} kWh`);
+    setDelta('kpiPfDelta', deltaSince(S.rings.pf, 60e3), v => `${fmt.pf.format(v)}`);
+    setDelta('kpiFreqDelta', deltaSince(S.rings.freq, 60e3), v => `${fmt.Hz.format(v)} Hz`);
+    setDelta('kpiCurrentDelta', deltaSince(S.rings.current, 60e3), v => `${fmt.A.format(v)} A`);
+    setDelta('kpiImbalanceDelta', deltaSince(S.rings.imbalance, 60e3), v => `${fmt.pct.format(v)} %`);
+
+    for (const [ring, { chart }] of sparkCharts) {
+      chart.data.datasets[0].data = S.rings[ring].map(e => e.v);
+      chart.update('none');
+    }
+  }
+
+  // ---------------------------------------------------------------- donut + system panel
+
+  let donut = null;
+  const donutCenter = {
+    id: 'donutCenter',
+    afterDraw(chart, args, opts) {
+      const { ctx, chartArea } = chart;
+      const cx = (chartArea.left + chartArea.right) / 2;
+      const cy = (chartArea.top + chartArea.bottom) / 2;
+      ctx.save();
+      ctx.textAlign = 'center';
+      ctx.fillStyle = cssVar('--muted');
+      ctx.font = '600 10.5px Inter, system-ui, sans-serif';
+      ctx.fillText('TOTAL', cx, cy - 7);
+      ctx.fillStyle = cssVar('--ink');
+      ctx.font = '700 16px Inter, system-ui, sans-serif';
+      ctx.fillText(chart.$center || '—', cx, cy + 13);
+      ctx.restore();
+    },
+  };
+
+  function buildDonut() {
+    donut = new Chart($('energyDonut'), {
+      type: 'doughnut',
+      data: {
+        labels: ['L1', 'L2', 'L3'],
+        datasets: [{
+          data: [0, 0, 0],
+          backgroundColor: [cssVar('--p1'), cssVar('--p2'), cssVar('--p3')],
+          borderWidth: 0, hoverOffset: 3,
+        }],
+      },
+      options: {
+        maintainAspectRatio: false, animation: { duration: 350 },
+        cutout: '70%',
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            backgroundColor: cssVar('--panel'), titleColor: cssVar('--ink'), bodyColor: cssVar('--muted'),
+            borderColor: cssVar('--line'), borderWidth: 1, padding: 10, cornerRadius: 8,
+            callbacks: { label: ctx => ` ${ctx.label}: ${fmtKwh(ctx.parsed)} kWh (${ctx.dataset.data.reduce((a, b) => a + b, 0) > 0 ? fmt.pct.format(ctx.parsed / ctx.dataset.data.reduce((a, b) => a + b, 0) * 100) : 0}%)` },
+          },
+        },
+      },
+      plugins: [donutCenter],
+    }, { value: '—' });
+  }
+
+  function updateDonut(s) {
+    if (!donut) return;
+    const e = PHASES.map(ph => s[ph].e_wh);
+    donut.data.datasets[0].data = e;
+    donut.$center = fmtKwh(s.tot.e_wh);
+    donut.data.datasets[0].phaseMeta = 'donut';
+    donut.update('none');
+    const total = e.reduce((a, b) => a + b, 0);
+    PHASES.forEach((ph, i) => {
+      $('donutLegend').querySelector(`[data-ph="${ph}"] .val`).textContent = `${fmtKwh(e[i])} kWh · ${fmt.pct.format(total > 0 ? e[i] / total * 100 : 0)}%`;
+    });
+  }
+
+  function buildDonutLegend() {
+    const el = $('donutLegend');
+    el.innerHTML = '';
+    PHASES.forEach((ph, i) => {
+      const row = document.createElement('div');
+      row.className = 'row';
+      row.dataset.ph = ph;
+      const key = document.createElement('span');
+      key.className = 'key';
+      key.innerHTML = `<i style="background:${cssVar(`--p${i + 1}`)}"></i>${ph.toUpperCase()}`;
+      const val = document.createElement('span');
+      val.className = 'val mono';
+      row.append(key, val);
+      el.append(row);
+    });
+  }
+
+  function updateSystem(s, meta) {
+    $('sysSeq').textContent = finite(s.seq) ? `sample #${s.seq}` : '—';
+    const rows = [
+      ['Frequency', finite(s.freq) ? `${fmt.Hz.format(s.freq)} Hz` : 'Unavailable'],
+      ['Active power', finite(s.tot.p) ? `${fmtKw(s.tot.p)} kW` : '—'],
+      ['Power factor', finite(s.tot.pf) ? fmt.pf.format(s.tot.pf) : '—'],
+      ['Phase imbalance', finite(s.tot.imbalance_p) ? `${fmt.pct.format(s.tot.imbalance_p)} %` : '—'],
+      ['Energy', finite(s.tot.e_wh) ? `${fmtKwh(s.tot.e_wh)} kWh` : '—'],
+      ['Sample age', '—'],
+    ];
+    const el = $('sysRows');
+    el.innerHTML = '';
+    for (const [k, v] of rows) {
+      const row = document.createElement('div');
+      row.className = 'sys-row';
+      row.innerHTML = `<span class="k">${k}</span><span class="sys-value">${v}</span>`;
+      el.append(row);
+    }
+    const age = meta ? Math.max(0, Date.now() - s.t) : null;
+    if (age !== null) el.querySelectorAll('.sys-row')[5].querySelector('.sys-value').textContent = `${(age / 1000).toFixed(1)} s`;
+  }
+
+  // ---------------------------------------------------------------- stat cards
+
+  function statCard(name, unit, value, meta, barPct = null) {
+    const card = document.createElement('article');
+    card.className = 'stat-card';
+    card.innerHTML = `
+      <div class="stat-head"><span class="name">${name}</span><span class="unit">${unit}</span></div>
+      <div class="stat-value mono">${value}</div>
+      <div class="stat-meta">${meta}</div>
+      ${barPct === null ? '' : `<div class="stat-bar"><div class="fill" style="width:${clamp(barPct, 0, 100)}%"></div><div class="marker" style="left:${clamp(barPct, 0, 100)}%"></div></div>`}`;
+    return card;
+  }
+
+  function updatePowerStats(s) {
+    const el = $('powerStats');
+    el.innerHTML = '';
+    const totD = s.tot;
+    const demand = k => PHASES.reduce((a, ph) => a + s[ph][k], 0);
+    el.append(
+      statCard('Active power', 'kW', fmtKw(totD.p), `demand ${fmtKw(demand('p_d'))} kW · L1 ${fmtKw(s.l1.p)} / L2 ${fmtKw(s.l2.p)} / L3 ${fmtKw(s.l3.p)} kW`),
+      statCard('Reactive power', 'kvar', fmtKvar(totD.q), `demand ${fmtKvar(demand('q_d'))} kvar · L1 ${fmtKvar(s.l1.q)} / L2 ${fmtKvar(s.l2.q)} / L3 ${fmtKvar(s.l3.q)} kvar`),
+      statCard('Apparent power', 'kVA', fmtKva(totD.s), `demand ${fmtKva(demand('s_d'))} kVA · L1 ${fmtKva(s.l1.s)} / L2 ${fmtKva(s.l2.s)} / L3 ${fmtKva(s.l3.s)} kVA`),
+    );
+  }
+
+  function updateVoltageStats(s) {
+    const el = $('voltageStats');
+    el.innerHTML = '';
+    PHASES.forEach(ph => {
+      const d = s[ph];
+      const range = d.vln_max - d.vln_min;
+      const pct = range > 0 ? (d.vln - d.vln_min) / range * 100 : 50;
+      el.append(statCard(`${ph.toUpperCase()} · phase to neutral`, 'V', fmt.V.format(d.vln),
+        `60 s range ${fmt.V.format(d.vln_min)}–${fmt.V.format(d.vln_max)} · avg ${fmt.V.format(d.vln_avg)} · L-L ${fmt.V.format(d.vll)}`, pct));
+    });
+  }
+
+  function updateCurrentStats(s) {
+    const el = $('currentStats');
+    el.innerHTML = '';
+    PHASES.forEach(ph => {
+      const d = s[ph];
+      el.append(statCard(`${ph.toUpperCase()} · line current`, 'A', fmt.A.format(d.i),
+        `demand ${fmt.A.format(d.i_d)} A · P ${fmtKw(d.p)} kW · PF ${fmt.pf.format(d.pf)}`));
+    });
+  }
+
+  function updateEnergyStats(points) {
+    const el = $('energyStats');
+    el.innerHTML = '';
+    const now = Date.now();
+    const d = (ms) => {
+      if (!points || points.length < 2) return null;
+      const first = points.find(p => p.t >= now - ms);
+      if (!first) return null;
+      const last = points[points.length - 1];
+      return last.tot.e_wh - first.tot.e_wh;
+    };
+    const h1 = d(3600e3), h24 = d(24 * 3600e3);
+    el.append(
+      statCard('Energy since start', 'kWh', S.latest ? fmtKwh(S.latest.tot.e_wh) : '—', 'accumulated across all three phases'),
+      statCard('Last hour', 'kWh', h1 === null ? '—' : fmtKwh(h1), h1 === null ? 'needs ≥ 1 h of history' : 'Δ from the last 60 minutes'),
+      statCard('Last 24 hours', 'kWh', h24 === null ? '—' : fmtKwh(h24), h24 === null ? 'needs ≥ 24 h of history' : 'Δ from the last day'),
+    );
+  }
+
+  // ---------------------------------------------------------------- live table
+
+  const TABLE_GROUPS = [
+    ['voltage_ln', 'Phase to neutral voltage', 'V', ph => ph.vln],
+    ['voltage_ln_min', 'Minimum phase to neutral voltage', 'V', ph => ph.vln_min],
+    ['voltage_ln_max', 'Maximum phase to neutral voltage', 'V', ph => ph.vln_max],
+    ['voltage_ln_avg', 'Average phase to neutral voltage', 'V', ph => ph.vln_avg],
+    ['voltage_ll', 'Phase to phase voltage', 'V', ph => ph.vll],
+    ['voltage_ll_min', 'Minimum phase to phase voltage', 'V', ph => ph.vll_min],
+    ['voltage_ll_max', 'Maximum phase to phase voltage', 'V', ph => ph.vll_max],
+    ['voltage_ll_avg', 'Average phase to phase voltage', 'V', ph => ph.vll_avg],
+    ['current', 'Current', 'A', ph => ph.i],
+    ['current_demand', 'Current demand', 'A', ph => ph.i_d],
+    ['active_power', 'Active power', 'W', ph => ph.p],
+    ['active_power_demand', 'Active power demand', 'W', ph => ph.p_d],
+    ['reactive_power', 'Reactive power', 'var', ph => ph.q],
+    ['reactive_power_demand', 'Reactive power demand', 'var', ph => ph.q_d],
+    ['apparent_power', 'Apparent power', 'VA', ph => ph.s],
+    ['apparent_power_demand', 'Apparent power demand', 'VA', ph => ph.s_d],
+    ['power_factor', 'Power factor', '—', ph => ph.pf],
+    ['cos_phi', 'Cosine phi', '—', ph => ph.cphi],
+    ['frequency', 'Frequency', 'Hz', ph => null],
+  ];
+  const tableCells = new Map();
+
+  function buildTable() {
+    const body = $('liveTableBody');
+    for (const [key, label, unit] of TABLE_GROUPS) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${label}</td>${[0, 1, 2].map(() => '<td class="ph num mono">—</td>').join('')}<td class="mono" style="color:var(--muted)">${unit}</td>`;
+      if (key === 'frequency') tr.classList.add('freq-row');
+      body.append(tr);
+      tableCells.set(key, { tr, cells: [...tr.querySelectorAll('td.ph')] });
+    }
+  }
+
+  function updateTable(s) {
+    for (const [key, label, unit, get] of TABLE_GROUPS) {
+      const { tr, cells } = tableCells.get(key);
+      if (key === 'frequency') {
+        cells[0].textContent = finite(s.freq) ? fmt.Hz.format(s.freq) : 'Unavailable';
+        cells[1].textContent = '—'; cells[2].textContent = '—';
+        continue;
+      }
+      PHASES.forEach((ph, i) => {
+        const v = get(s[ph]);
+        cells[i].textContent = finite(v) ? (unit === 'W' || unit === 'var' || unit === 'VA' ? fmt.W.format(v)
+          : unit === 'V' ? fmt.V.format(v) : unit === 'A' ? fmt.A.format(v) : fmt.pf.format(v)) : '—';
+      });
+    }
+    $('tableStamp').textContent = `#${s.seq} · ${fmtClock(s.t)}`;
+  }
+
+  // ---------------------------------------------------------------- balance (quality view)
+
+  function updateBalance(s) {
+    const el = $('balanceRows');
+    el.innerHTML = '';
+    const pDSum = PHASES.reduce((a, ph) => a + (finite(s[ph].p_d) ? s[ph].p_d : 0), 0);
+    const loadMeaningful = finite(s.tot.p) && s.tot.p > 1e-6 && (pDSum <= 0 || s.tot.p >= pDSum * 0.01);
+    if (!loadMeaningful) {
+      const empty = document.createElement('p');
+      empty.className = 'detail-note';
+      empty.textContent = 'No measurable load — live phase powers are near zero relative to demand (or inputs are not connected yet).';
+      el.append(empty);
+      return;
+    }
+    const total = s.tot.p;
+    const colors = { l1: cssVar('--p1'), l2: cssVar('--p2'), l3: cssVar('--p3') };
+    const segs = PHASES.map(ph => {
+      const p = s[ph].p;
+      return { ph, p, share: total > 0 ? p / total * 100 : 0, color: colors[ph] };
+    });
+    const bar = document.createElement('div');
+    bar.className = 'balance-bar';
+    segs.forEach(seg => {
+      const i = document.createElement('i');
+      i.style.width = `${seg.share}%`;
+      i.style.background = seg.color;
+      bar.append(i);
+    });
+    el.append(bar);
+    for (const seg of segs) {
+      const row = document.createElement('div');
+      row.className = 'balance-row';
+      row.innerHTML = `<div class="top"><b style="color:${seg.color}">${seg.ph.toUpperCase()}</b><span class="mono">${fmtKw(seg.p)} kW · ${fmt.pct.format(seg.share)}%</span></div>`;
+      el.append(row);
+    }
+  }
+
+  // ---------------------------------------------------------------- history + charts
+
+  const chartDefs = {
+    overviewPowerChart: [
+      { phase: 'l1', key: 'p', colorKey: '--p1', label: 'L1', fill: true, stack: 'ph' },
+      { phase: 'l2', key: 'p', colorKey: '--p2', label: 'L2', fill: true, stack: 'ph' },
+      { phase: 'l3', key: 'p', colorKey: '--p3', label: 'L3', fill: true, stack: 'ph' },
+      { phase: 'total', key: 'p', colorKey: '--muted', label: 'Total', dashed: true, stack: 'tot' },
+    ],
+    powerPChart: [
+      { phase: 'l1', key: 'p', colorKey: '--p1', label: 'L1', fill: true, stack: 'ph' },
+      { phase: 'l2', key: 'p', colorKey: '--p2', label: 'L2', fill: true, stack: 'ph' },
+      { phase: 'l3', key: 'p', colorKey: '--p3', label: 'L3', fill: true, stack: 'ph' },
+      { phase: 'total', key: 'p', colorKey: '--muted', label: 'Total', dashed: true, stack: 'tot' },
+    ],
+    powerQChart: [
+      { phase: 'l1', key: 'q', colorKey: '--p1', label: 'L1 · var' }, { phase: 'l2', key: 'q', colorKey: '--p2', label: 'L2 · var' },
+      { phase: 'l3', key: 'q', colorKey: '--p3', label: 'L3 · var' }, { phase: 'total', key: 'q', colorKey: '--muted', label: 'Total', dashed: true },
+    ],
+    powerSChart: [
+      { phase: 'l1', key: 's', colorKey: '--p1', label: 'L1 · VA' }, { phase: 'l2', key: 's', colorKey: '--p2', label: 'L2 · VA' },
+      { phase: 'l3', key: 's', colorKey: '--p3', label: 'L3 · VA' }, { phase: 'total', key: 's', colorKey: '--muted', label: 'Total', dashed: true },
+    ],
+    powerDChart: [
+      { phase: 'l1', key: 'p_d', colorKey: '--p1', label: 'L1' }, { phase: 'l2', key: 'p_d', colorKey: '--p2', label: 'L2' },
+      { phase: 'l3', key: 'p_d', colorKey: '--p3', label: 'L3' }, { phase: 'total', key: 'p', colorKey: '--muted', label: 'Total now', dashed: true },
+    ],
+    voltageLnChart: [
+      { phase: 'l1', key: 'vln', colorKey: '--p1', label: 'L1 · V' }, { phase: 'l2', key: 'vln', colorKey: '--p2', label: 'L2 · V' },
+      { phase: 'l3', key: 'vln', colorKey: '--p3', label: 'L3 · V' },
+    ],
+    voltageLlChart: [
+      { phase: 'l1', key: 'vll', colorKey: '--p1', label: 'L1-L2 · V' }, { phase: 'l2', key: 'vll', colorKey: '--p2', label: 'L2-L3 · V' },
+      { phase: 'l3', key: 'vll', colorKey: '--p3', label: 'L3-L1 · V' },
+    ],
+    currentChart: [
+      { phase: 'l1', key: 'i', colorKey: '--p1', label: 'L1 · A' }, { phase: 'l2', key: 'i', colorKey: '--p2', label: 'L2 · A' },
+      { phase: 'l3', key: 'i', colorKey: '--p3', label: 'L3 · A' }, { phase: 'total', key: 'i', colorKey: '--muted', label: 'Total', dashed: true },
+    ],
+    currentDChart: [
+      { phase: 'l1', key: 'i_d', colorKey: '--p1', label: 'L1' }, { phase: 'l2', key: 'i_d', colorKey: '--p2', label: 'L2' },
+      { phase: 'l3', key: 'i_d', colorKey: '--p3', label: 'L3' },
+    ],
+    pfChart: [
+      { phase: 'l1', key: 'pf', colorKey: '--p1', label: 'L1' }, { phase: 'l2', key: 'pf', colorKey: '--p2', label: 'L2' },
+      { phase: 'l3', key: 'pf', colorKey: '--p3', label: 'L3' }, { phase: 'total', key: 'pf', colorKey: '--muted', label: 'Avg', dashed: true },
+    ],
+    freqChart: [{ phase: 'total', key: 'freq', colorKey: '--accent', label: 'Frequency · Hz', fill: true }],
+  };
+  const charts = new Map();
+  const CHART_VIEWS = {
+    overview: ['overviewPowerChart'],
+    power: ['powerPChart', 'powerQChart', 'powerSChart', 'powerDChart'],
+    voltage: ['voltageLnChart', 'voltageLlChart'],
+    current: ['currentChart', 'currentDChart'],
+    quality: ['pfChart', 'freqChart'],
+    energy: ['energyBarChart'],
+  };
+
+  function createChartFor(id) {
+    if (id === 'energyBarChart') {
+      const c = chartPalette();
+      const bar = new Chart($('energyBarChart'), {
+        type: 'bar',
+        data: {
+          datasets: PHASES.map((ph, i) => ({
+            label: ph.toUpperCase(),
+            data: [],
+            backgroundColor: cssVar(`--p${i + 1}`),
+            borderRadius: 2,
+            stack: 'e',
+            phaseMeta: ph,
+          })),
+        },
+        options: {
+          maintainAspectRatio: false, animation: { duration: 350 },
+          interaction: { mode: 'index', intersect: false },
+          plugins: {
+            legend: { display: false },
+            tooltip: {
+              backgroundColor: c.panel, titleColor: c.ink, bodyColor: c.muted,
+              borderColor: c.line, borderWidth: 1, padding: 10, cornerRadius: 8,
+              callbacks: {
+                title: items => items.length && items[0].raw ? fmtAxisTime(items[0].raw.x, S.lastHistorySpan || 600e3) : '',
+                label: ctx => ` ${ctx.dataset.label}: ${(nf(3, 3)).format(ctx.parsed.y)} kWh`,
+              },
+            },
+          },
+          scales: {
+            x: {
+              type: 'linear', offset: true,
+              ticks: { color: c.faint, maxTicksLimit: 10, maxRotation: 0, font: { size: 10.5 }, callback(v) { return fmtAxisTime(v, S.lastHistorySpan || 600e3); } },
+              grid: { display: false },
+            },
+            y: { beginAtZero: true, ticks: { color: c.faint, font: { size: 10.5 } }, grid: { color: c.line }, border: { display: false } },
+          },
+        },
+      });
+      charts.set('energyBarChart', bar);
+      bar.options.scales.y.title = { display: true, text: 'kWh', color: cssVar('--faint'), font: { size: 10.5 } };
+      S.chartSpecs.push({ chart: bar, series: PHASES.map(ph => ({ phase: ph, colorKey: `--p${PHASES.indexOf(ph) + 1}`, fill: false })) });
+      return bar;
+    }
+    const series = chartDefs[id];
+    const ds = series.map(s => {
+      const ds = seriesDs(s.phase, s.colorKey, s.label, null, s);
+      ds.colorKey = s.colorKey;
+      return ds;
+    });
+    // assign unit formatters + y-axis titles per chart (axis shows raw units)
+    const unitLabel = id.includes('Power') || id.includes('DChart') ? 'W'
+      : id.includes('QChart') ? 'var' : id.includes('SChart') ? 'VA'
+      : id.includes('voltage') ? 'V' : id.includes('current') ? 'A'
+      : id.includes('freq') ? 'Hz' : id.includes('pf') ? '' : 'W';
+    const unit = id.includes('Power') || id.includes('DChart') ? fmt.W
+      : id.includes('QChart') ? fmt.W : id.includes('SChart') ? fmt.W
+      : id.includes('voltage') ? fmt.V : id.includes('current') ? fmt.A
+      : id.includes('pf') ? fmt.pf : id.includes('freq') ? fmt.Hz : fmt.W;
+    ds.forEach(d => { d.unitFmt = unit; });
+    const chart = makeChart(id, ds);
+    if (chart && unitLabel) {
+      chart.options.scales.y.title = { display: true, text: unitLabel, color: cssVar('--faint'), font: { size: 10.5 } };
+    }
+    charts.set(id, chart);
+    return chart;
+  }
+
+  // Charts are created lazily on first view activation: Chart.js cannot size
+  // a canvas that was display:none at creation time (its resize observer never
+  // re-attaches), so we never create charts while their view is hidden.
+  function ensureChartsFor(view) {
+    for (const id of CHART_VIEWS[view] || []) {
+      if (!charts.has(id)) createChartFor(id);
+    }
+  }
+
+  function buildCharts() {
+    ensureChartsFor('overview');
+  }
+
+  function energyBuckets(points, range) {
+    if (!points || points.length < 2) return [];
+    const perHour = ['6h', '24h', '7d'].includes(range);
+    const sizeMs = perHour ? 3600e3 : 60e3;
+    const buckets = [];
+    let cur = null;
+    for (let i = 1; i < points.length; i++) {
+      const p = points[i], prev = points[i - 1];
+      const t0 = Math.floor(p.t / sizeMs) * sizeMs;
+      if (!cur || cur.t0 !== t0) {
+        if (cur) buckets.push(cur);
+        cur = { t0, t1: t0 + sizeMs, e: { l1: 0, l2: 0, l3: 0 } };
+      }
+      for (const ph of PHASES) cur.e[ph] += p[ph].e_wh - prev[ph].e_wh;
+      cur.t1 = t0 + sizeMs;
+    }
+    if (cur) buckets.push(cur);
+    return buckets;
+  }
+
+  function updateCharts(points) {
+    for (const [id, chart] of charts) {
+      if (id === 'energyBarChart' || !chart) continue;
+      const series = chartDefs[id];
+      updateChart(chart, series, points);
+    }
+    const bar = charts.get('energyBarChart');
+    if (!bar) return;
+    const buckets = energyBuckets(points, S.range);
+    PHASES.forEach((ph, i) => {
+      bar.data.datasets[i].data = buckets.map(b => ({ x: b.t0, y: b.e[ph] / 1000 }));
+    });
+    bar.update('none');
+    $('energyChartTitle').textContent = ['live', '1h'].includes(S.range) ? 'Energy per minute' : 'Energy per hour';
+    $('energyChartSub').textContent = `kWh · ${['live', '1h'].includes(S.range) ? '60 s buckets' : 'hourly buckets'}`;
+    updateEnergyStats(points);
+  }
+
+  async function fetchHistory(force = false) {
+    const liveRange = ['live', '1h'].includes(S.range);
+    if (!force && !liveRange && Date.now() - S.lastHistoryFetch < 15000) return;
+    S.lastHistoryFetch = Date.now();
+    try {
+      const res = await fetch(`/api/history?range=${S.range}`, { cache: 'no-store' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      if (!Array.isArray(data.points) || !data.points.length) return;
+      S.lastHistory = data.points;
+      S.lastHistorySpan = data.points[data.points.length - 1].t - data.points[0].t || 600e3;
+      updateCharts(data.points);
+    } catch { /* banner handled by readings poll */ }
+  }
+
+  // ---------------------------------------------------------------- readings poll
+
+  async function pollReadings() {
+    try {
+      const res = await fetch('/api/readings', { cache: 'no-store', headers: { Accept: 'application/json' } });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      if (!data.sample || !data.sample.tot) throw new Error('invalid readings response');
+      S.latest = data.sample;
+      S.meta = data.meta;
+      S.online = true;
+      hideNotice();
+      updateKpis(data.sample);
+      updateDonut(data.sample);
+      updateSystem(data.sample, data.meta);
+      updateTable(data.sample);
+      updatePowerStats(data.sample);
+      updateVoltageStats(data.sample);
+      updateCurrentStats(data.sample);
+      updateBalance(data.sample);
+      updateSourcePills(data);
+    } catch (err) {
+      S.online = false;
+      showNotice(`Unable to reach the server API (${err.message || 'network error'}). Last known values remain visible; retrying automatically.`);
+    }
+  }
+
+  function updateSourcePills(data) {
+    const source = data && data.source;
+    const meta = data && data.meta;
+    const dev = meta && meta.device && typeof meta.device === 'object' ? meta.device : null;
+    const sim = meta && meta.sim;
+    const mode = meta ? meta.source_mode : null;
+    const pill = $('sourcePill');
+    const dot = $('sideDot');
+    let pillText, pillCls, dotCls, sideText, bannerMsg = null, bannerKind = 'info';
+
+    if (source === 'device') {
+      if (!dev || !dev.connected) {
+        pillText = 'Device offline'; pillCls = 'pill bad'; dotCls = 'dot bad';
+        bannerMsg = `Cannot reach the ESP32 (${dev && dev.last_error ? dev.last_error : 'network error'}). Showing last known values.`;
+        bannerKind = 'error';
+      } else if (dev.stale) {
+        pillText = 'Device stale'; pillCls = 'pill warn'; dotCls = 'dot warn';
+        bannerMsg = 'ESP32 readings are stale (meter or adapter issue). Showing last known values.';
+      } else {
+        pillText = 'Device'; pillCls = 'pill good'; dotCls = 'dot ok pulse';
+      }
+      sideText = 'ESP32 device';
+      if (dev && dev.candidate_layout) {
+        bannerMsg = (bannerMsg ? bannerMsg + ' ' : '') + 'Provisional register map — labels and units still need verification against the analyzer display.';
+      }
+    } else {
+      if (sim && sim.running) {
+        pillText = 'Simulation'; pillCls = 'pill warn'; dotCls = 'dot ok pulse';
+        sideText = mode === 'auto' ? 'Simulator · auto (waiting for ESP32)' : 'Simulator running';
+      } else {
+        pillText = 'Paused'; pillCls = 'pill'; dotCls = 'dot warn';
+        sideText = 'Simulator paused';
+      }
+    }
+    if (!S.online) { dotCls = 'dot bad'; }
+
+    pill.textContent = pillText; pill.className = pillCls;
+    dot.className = dotCls;
+    $('sideSource').textContent = sideText;
+    if (bannerMsg) { showNotice(bannerMsg, bannerKind); S.deviceBanner = true; }
+    else if (S.deviceBanner && !S.paused) { hideNotice(); S.deviceBanner = false; }
+    $('sideMeta').textContent = meta
+      ? `seq #${S.latest ? S.latest.seq : '—'} · ${meta.buffers.sec} s + ${meta.buffers.min} min buffered`
+      : '—';
+    if (meta) {
+      $('footerInfo').textContent = `Server uptime ${fmtUptime(Date.now() - meta.started_at)} · poll ${S.pollMs / 1000}s · ${meta.buffers.sec} one-second + ${meta.buffers.min} one-minute samples`;
+      const modeSel = $('sourceMode');
+      if (modeSel && mode && modeSel.value !== mode) modeSel.value = mode;
+      if (meta.esp32_url) $('esp32UrlNote').textContent = meta.esp32_url;
+    }
+    const agoS = ms => (ms == null ? '—' : `${Math.max(0, Math.round((Date.now() - ms) / 1000))} s ago`);
+    const rows = [
+      ['Source', source === 'device' ? 'ESP32 device' : 'Built-in simulator'],
+      ['Source mode', mode === 'auto' ? 'Auto' : mode === 'device' ? 'ESP32 only' : 'Simulator only'],
+      ['Data flow', dev && dev.feed === 'push' ? 'ESP32 → server (push)' : 'server → ESP32 (pull)'],
+      ['Latest sample', S.latest ? `#${S.latest.seq} · ${fmtClock(S.latest.t)}` : '—'],
+      ['ESP32 status', !dev ? '—' : !dev.connected ? `unreachable · ${dev.last_error || ''}` : dev.stale ? 'stale readings' : 'connected'],
+      ['ESP32 last seen', dev && dev.last_seen ? `${fmtClock(dev.last_seen)} (${agoS(dev.last_seen)})` : 'never'],
+      ['Meter adapter', dev && dev.adapter_connected === true ? `connected · ${dev.baudrate || '?'} baud` : dev && dev.adapter_connected === false ? 'disconnected' : '—'],
+      ['Meter device id', dev && dev.device_id != null ? `Device ${dev.device_id}` : '—'],
+      ['Meter sequence', dev && dev.sequence != null ? `#${dev.sequence}` : '—'],
+      ['Registers', dev && dev.register_count != null ? `${dev.register_count} words @ ${dev.start_address}` : '—'],
+      ['Server started', meta ? fmtClock(meta.started_at) : '—'],
+      ['History buffers', meta ? `${meta.buffers.sec} s / ${meta.buffers.min} min` : '—'],
+      ['Push ingest', 'POST /api/ingest'],
+    ];
+    const el = $('sourceRows');
+    el.innerHTML = '';
+    for (const [k, v] of rows) {
+      const row = document.createElement('div');
+      row.className = 'setting-row';
+      row.innerHTML = `<span class="k">${k}</span><span class="v mono">${v}</span>`;
+      el.append(row);
+    }
+  }
+
+  // ---------------------------------------------------------------- loop
+
+  async function loop() {
+    if (!S.paused) {
+      await pollReadings();
+      await fetchHistory();
+    }
+    S.timer = setTimeout(loop, S.pollMs);
+  }
+
+  // ---------------------------------------------------------------- views & controls
+
+  const VIEW_META = {
+    overview: ['Overview', 'Three-phase measurements · TPM-04-100D'],
+    power: ['Power', 'Active, reactive and apparent power per phase'],
+    voltage: ['Voltage', 'Phase to neutral and phase to phase'],
+    current: ['Current', 'Line currents and rolling demand'],
+    quality: ['Power quality', 'Power factor, frequency and phase balance'],
+    energy: ['Energy', 'Accumulated energy and bucket breakdown'],
+    table: ['Live data', 'All measurement groups · updated every poll'],
+    settings: ['Settings', 'Data source, simulator and appearance'],
+  };
+
+  function showView(name) {
+    S.view = name;
+    for (const btn of document.querySelectorAll('.nav-item')) {
+      btn.classList.toggle('active', btn.dataset.view === name);
+    }
+    for (const sec of document.querySelectorAll('.view')) {
+      sec.classList.toggle('active', sec.dataset.view === name);
+    }
+    const [title, sub] = VIEW_META[name] || [name, ''];
+    $('viewTitle').textContent = title;
+    $('viewSubtitle').textContent = sub;
+    // create the view's charts only now that it is visible, then feed them.
+    // Synchronous: Chart.js reads the container size itself (forcing layout),
+    // and rAF can be throttled to never fire in background tabs.
+    ensureChartsFor(name);
+    if (S.lastHistory) updateCharts(S.lastHistory);
+    if (CHART_VIEWS[name]) fetchHistory(true);
+    if (S.latest) updateEnergyStats(S.lastHistory);
+  }
+
+  function applyPhaseVisibility() {
+    for (const { chart } of S.chartSpecs) {
+      chart.data.datasets.forEach(d => {
+        if (d.phaseMeta && d.phaseMeta in S.phasesOn) d.hidden = !S.phasesOn[d.phaseMeta];
+      });
+      chart.update('none');
+    }
+  }
+
+  function bindControls() {
+    for (const btn of document.querySelectorAll('.nav-item')) {
+      btn.addEventListener('click', () => showView(btn.dataset.view));
+    }
+    $('rangeSelect').addEventListener('change', e => {
+      S.range = e.target.value;
+      fetchHistory(true);
+    });
+    for (const chip of document.querySelectorAll('.chip')) {
+      chip.addEventListener('click', () => {
+        const ph = chip.dataset.phase;
+        S.phasesOn[ph] = !S.phasesOn[ph];
+        chip.classList.toggle('active', S.phasesOn[ph]);
+        applyPhaseVisibility();
+      });
+    }
+    $('pauseBtn').addEventListener('click', () => {
+      S.paused = !S.paused;
+      $('pauseBtn').classList.toggle('active', S.paused);
+      $('pauseBtn').setAttribute('aria-pressed', String(S.paused));
+      $('pauseBtn').textContent = S.paused ? '▶' : '❚❚';
+      if (S.paused) showNotice('Live updates paused. Charts keep their last known values.', 'info');
+      else hideNotice();
+    });
+
+    // theme
+    const apply = (theme) => {
+      S.theme = theme;
+      document.documentElement.dataset.theme = theme;
+      localStorage.setItem('emTheme', theme);
+      $('darkToggle').checked = theme === 'dark';
+      applyTheme();
+      buildDonutLegend();
+    };
+    $('themeBtn').addEventListener('click', () => apply(S.theme === 'dark' ? 'light' : 'dark'));
+    $('darkToggle').addEventListener('change', e => apply(e.target.checked ? 'dark' : 'light'));
+
+    // simulator controls
+    const postSim = (body) => fetch('/api/sim', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    }).catch(() => {});
+    $('simRunning').addEventListener('change', e => postSim({ running: e.target.checked }));
+    let multTimer = null;
+    $('simMultiplier').addEventListener('input', e => {
+      $('multOut').textContent = `${Number(e.target.value).toFixed(2)}×`;
+      clearTimeout(multTimer);
+      multTimer = setTimeout(() => postSim({ multiplier: Number(e.target.value) }), 200);
+    });
+    let noiseTimer = null;
+    $('simNoise').addEventListener('input', e => {
+      $('noiseOut').textContent = Number(e.target.value).toFixed(1);
+      clearTimeout(noiseTimer);
+      noiseTimer = setTimeout(() => postSim({ noise: Number(e.target.value) }), 200);
+    });
+    $('spikeBtn').addEventListener('click', () => postSim({ spike: true }));
+    $('sourceMode').addEventListener('change', e => {
+      fetch('/api/source', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: e.target.value }),
+      }).catch(() => {});
+    });
+    $('pollInterval').addEventListener('change', e => {
+      S.pollMs = Number(e.target.value) * 1000;
+      $('pollOut').textContent = `${e.target.value} s`;
+      localStorage.setItem('emPollMs', S.pollMs);
+      clearTimeout(S.timer);
+      S.timer = setTimeout(loop, S.pollMs);
+    });
+
+    // CSV exports
+    $('csvEnergy').addEventListener('click', () => {
+      const buckets = energyBuckets(S.lastHistory, S.range);
+      if (!buckets.length) return;
+      const rows = [['Bucket start (local)', 'kWh L1', 'kWh L2', 'kWh L3', 'kWh total'],
+        ...buckets.map(b => [new Date(b.t0).toLocaleString(), b.e.l1.toFixed(5), b.e.l2.toFixed(5), b.e.l3.toFixed(5), (b.e.l1 + b.e.l2 + b.e.l3).toFixed(5)])];
+      downloadCsv(`energy-${S.range}-${Date.now()}.csv`, rows);
+    });
+    $('csvPower').addEventListener('click', () => {
+      const pts = S.lastHistory || [];
+      if (!pts.length) return;
+      const rows = [['Time (local)', 'P L1 (W)', 'P L2 (W)', 'P L3 (W)', 'P total (W)', 'Q total (var)', 'S total (VA)', 'PF'],
+        ...pts.map(p => [new Date(p.t).toLocaleString(), p.l1.p.toFixed(1), p.l2.p.toFixed(1), p.l3.p.toFixed(1), p.tot.p.toFixed(1), p.tot.q.toFixed(1), p.tot.s.toFixed(1), p.tot.pf.toFixed(3)])];
+      downloadCsv(`power-${S.range}-${Date.now()}.csv`, rows);
+    });
+  }
+
+  function downloadCsv(name, rows) {
+    const csv = rows.map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  }
+
+  // ---------------------------------------------------------------- boot
+
+  function boot() {
+    if (typeof Chart === 'undefined') {
+      showNotice('Chart.js failed to load — check public/vendor/chart.umd.min.js.');
+      return;
+    }
+    Chart.defaults.font.family = "'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif";
+    Chart.defaults.color = cssVar('--muted');
+
+    document.documentElement.dataset.theme = S.theme;
+    $('darkToggle').checked = S.theme === 'dark';
+    $('pollInterval').value = S.pollMs / 1000;
+    $('pollOut').textContent = `${S.pollMs / 1000} s`;
+
+    buildSparks();
+    buildDonut();
+    buildDonutLegend();
+    buildCharts();
+    buildTable();
+    bindControls();
+    showView('overview');
+
+    setInterval(() => { $('clock').textContent = fmtClock(Date.now()); }, 1000);
+    $('clock').textContent = fmtClock(Date.now());
+
+    loop();
+  }
+
+  boot();
+})();
