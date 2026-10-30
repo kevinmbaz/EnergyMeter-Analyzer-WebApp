@@ -818,9 +818,6 @@
         dotCls = S.paused ? 'dot warn' : 'dot ok pulse';
       }
       sideText = pillText;
-      if (dev && dev.candidate_layout) {
-        bannerMsg = (bannerMsg ? bannerMsg + ' ' : '') + 'Provisional register map — labels and units still need verification against the analyzer display.';
-      }
     } else {
       if (sim && sim.running) {
         pillText = 'Simulation'; pillCls = 'pill warn'; dotCls = 'dot ok pulse';

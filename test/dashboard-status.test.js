@@ -39,6 +39,22 @@ function readings(code, severity, message) {
   } };
 }
 
+test('provisional register metadata never shows a banner or adds text to a communication fault', () => {
+  for (const [code, severity, message] of [
+    ['ok', 'ok', 'ESP32 connected; meter readings are live.'],
+    ['esp32_offline', 'error', 'Communication lost with ESP32.'],
+    ['meter_stale', 'warning', 'RS-485 is not receiving meter data.'],
+  ]) {
+    const data = readings(code, severity, message);
+    data.meta.device.candidate_layout = true;
+    const h = clientHarness(data);
+    h.updateSourcePills(data);
+    assert.equal(h.get('notice').hidden, code === 'ok');
+    assert.ok(!h.get('noticeText').textContent.includes('Provisional register map'));
+    if (code !== 'ok') assert.equal(h.get('noticeText').textContent, message + ' No valid meter sample yet.');
+  }
+});
+
 test('dashboard displays specific fault feedback and a non-live badge', () => {
   for (const [code, severity, message, label] of [
     ['adapter_disconnected', 'error', 'ESP32 reports RS-485 adapter disconnected.', 'RS-485 disconnected'],

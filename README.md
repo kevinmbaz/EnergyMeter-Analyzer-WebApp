@@ -15,8 +15,8 @@ Data-source modes (Settings → Data source):
 - **ESP32 only**: device data, sim off.
 - **Simulator only**: dev mode with sim controls (load, noise, spike).
 
-While the register map stays unverified, a "Provisional register map" banner
-is shown and all labels/units are treated as provisional. Energy counters are
+The dashboard shows communication faults, not a provisional-register-map
+banner. Register labels/units still await verification. Energy counters are
 integrated server-side from active power until the meter's energy registers
 are decoded.
 
