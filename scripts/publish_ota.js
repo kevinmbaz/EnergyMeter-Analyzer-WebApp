@@ -78,8 +78,10 @@ if (typeof sha256 !== 'string' || !/^[0-9a-fA-F]{64}$/.test(sha256)) fail('sha25
 
 if (bin.length !== size) fail(`size mismatch: manifest says ${size}, firmware.bin is ${bin.length} bytes`);
 
-const header = ota.validateImageHeader(bin);
-if (!header.ok) fail(header.error);
+const validated = ota.validateApplicationImage(bin);
+if (!validated.ok) fail(validated.error);
+if (validated.meta.version !== version) fail(`version mismatch: image says ${validated.meta.version}, manifest says ${version}`);
+if (validated.meta.project !== project) fail(`project mismatch: image says ${validated.meta.project}, manifest says ${project}`);
 
 const actualSha = ota.sha256hex(bin);
 if (actualSha !== sha256.toLowerCase()) {

@@ -40,16 +40,36 @@ this machine.
 - **Voltage** — L-N and L-L charts, per-phase min/max/avg cards with range bars.
 - **Current** — line currents and demand.
 - **Power quality** — power factor, frequency, phase-balance breakdown.
-- **Energy** — kWh per minute/hour bars, since-start / 1 h / 24 h totals,
+- **Energy** — kWh per minute/hour/day/week/month bars, since-start / 1 h / 24 h totals,
   CSV export (energy and power).
 - **Live data** — the 19 measurement groups × 3 phases, live (same set as the
   ESP32 dashboard).
 - **Settings** — data-source status, simulator controls (on/off, load
   multiplier, noise, spike injection), theme, poll interval.
 
-Interactions: phase toggles (L1/L2/L3/Total) apply to every chart, time-range
-selector (10 min live → 7 days), pause/resume live updates, dark/light theme
-(persisted), CSV export.
+Interactions: phase toggles (L1/L2/L3/Total) apply to every chart, a time-range
+selector (1 minute → 5 years), pause/resume live updates, dark/light theme
+(persisted), CSV export. Hover or touch a time-series/energy chart for a crosshair
+and a tooltip with the full date/time, phase values and measurement units.
+
+### Chart time ranges
+
+Use the **Chart time range** selector in the top bar; it applies to all chart
+views. Choices are 1, 5, 10 (Live), 15 and 30 minutes; 1 and 6 hours; 24 hours
+and 7 days; 1, 3 and 6 months; and 1, 2 and 5 years. These are rolling windows:
+month choices mean 30/90/180 days, and each year means 365 days.
+
+Long ranges read the stored SQLite history, not just the recent in-memory
+buffers, with at most 720 plotted points. The chart keeps the selected time
+window even when only recent data exists; history is not invented before
+recording started. The history line above the charts shows the actual plotted
+date coverage, empty periods and storage warnings. Older data is available only
+if it was recorded and retained under `DB_RETENTION_DAYS`.
+
+Axis labels adapt to the selected period, while hover tooltips always include
+the complete date and time. Energy bars use minute/hour/day/week buckets or
+calendar months (UTC) as appropriate. Counter resets are not negative usage.
+The small KPI sparklines and energy-share donut remain live summaries.
 
 ## API
 
@@ -57,10 +77,15 @@ selector (10 min live → 7 days), pause/resume live updates, dark/light theme
 |---|---|
 | `GET /api/status` | source + source mode, ESP32 status, uptime, buffers |
 | `GET /api/readings` | latest full measurement snapshot |
-| `GET /api/history?range=live\|1h\|6h\|24h\|7d` | time series (≤720 pts) |
+| `GET /api/history?range=...` | time series from minutes to years (≤720 pts), requested bounds and storage status |
 | `POST /api/source` | `{mode: auto\|device\|simulation}` — data source switch |
 | `POST /api/sim` | `{running, multiplier, noise, spike}` (simulator dev tool) |
 | `POST /api/ingest` | push seam — the ESP32 may POST readings here instead |
+
+History API range keys: `1m`, `5m`, `live`, `15m`, `30m`, `1h`, `6h`, `24h`,
+`7d`, `30d`, `90d`, `180d`, `1y`, `2y`, `5y`. Responses include `from`, `to`,
+`span_ms`, `storage`, `partial` and any storage-fallback `warning`, alongside
+`range`, `unit`, `generated_at` and `points`. Unknown ranges return HTTP 400.
 
 ESP32 config via env: `ESP32_URL` (default `http://energymeter.local/api/readings`),
 `ESP32_POLL_MS` (default 2000), `ESP32_TIMEOUT_MS` (default 4000).
@@ -86,8 +111,10 @@ History: 1 s resolution kept for 2 h, 1 min aggregates kept for 7 days
 
 The dashboard shows a persistent warning and sidebar status for:
 
-- **ESP32 offline:** no valid payload received for 15 seconds, or a failed pull
-  when push is not active. Check ESP32 power, Wi-Fi and the network path.
+- **ESP32 offline:** no valid readings/status payload received for more than 8
+  seconds, for both push and pull feeds. A single failed or delayed pull does not
+  immediately disconnect the ESP32 or discard its last readings; each successful
+  payload resets the timeout. Check ESP32 power, Wi-Fi and the network path.
 - **RS-485 disconnected:** the ESP32 explicitly reports `adapter_connected: false`.
 - **Meter error:** the ESP32 is reachable but reports `meter.last_error` (shown
   verbatim as text, for example a Modbus timeout).
@@ -119,6 +146,21 @@ the server can only report loss of ESP32 contact. Set `ESP32_URL=''` to disable
 LAN polling; either successful transport counts as contact when both are active.
 
 Run regression tests with `npm test` (no additional dependencies).
+
+## ESP32 console logs (private)
+
+`POST /api/serial-log` accepts up to 4,096 bytes of raw UTF-8 console text,
+authenticated with the existing `X-OTA-Token`. The device/boot/sequence headers
+deduplicate retries in SQLite. Text and metadata survive restarts unchanged.
+`GET /api/serial-log` provides cursor-paginated JSON for the website, or
+`?format=text` for an inert plain-text response. Both endpoints are restricted
+by `OTA_ALLOW_CIDRS`; the browser does not receive the OTA token.
+
+Headers, bounds, response formats and safe text rendering:
+[`docs/serial-log-guide.md`](docs/serial-log-guide.md).
+Open **Settings → ESP32 serial console**, the first full-width panel, to view
+received logs. It follows new batches automatically and provides pause/resume,
+manual refresh, auto-scroll, device selection and a display-only clear button.
 
 ## ESP32 OTA (private, pull-based)
 

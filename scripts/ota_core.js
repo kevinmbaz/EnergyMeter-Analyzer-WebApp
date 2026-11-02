@@ -18,7 +18,7 @@ const crypto = require('node:crypto');
 const OTA_SIZE_CAP = 0x3f0000;
 const OTA_SEMVER = /^\d+\.\d+\.\d+$/;
 const ESP32S3_CHIP_ID = 0x0009;
-const APP_DESC_OFFSET = 0x30; // header 0x18 + ext header 0x10 + segment header 0x08
+const APP_DESC_OFFSET = 0x20; // complete image header 0x18 + first segment header 0x08
 const APP_DESC_MAGIC = 0xABCD5432;
 
 const sha256hex = buf => crypto.createHash('sha256').update(buf).digest('hex');
@@ -39,23 +39,46 @@ function validateImageHeader(buf, sizeCap = OTA_SIZE_CAP) {
 
 /**
  * Parse the ESP-IDF app descriptor (version + project name) from the image.
- * Returns null when the descriptor is absent or malformed — header-level
- * validation is separate, and the CLI path may supply metadata externally.
+ * Returns null when the descriptor is absent or malformed. Do not scan for a
+ * magic value elsewhere: the descriptor must be in the first segment.
  */
 function parseImageMeta(buf) {
-  if (!Buffer.isBuffer(buf) || buf.length < APP_DESC_OFFSET + 80) return null;
+  if (!Buffer.isBuffer(buf) || buf.length < APP_DESC_OFFSET + 256) return null;
+  const firstSegmentSize = buf.readUInt32LE(28);
+  if (firstSegmentSize < 256 || firstSegmentSize > buf.length - APP_DESC_OFFSET) return null;
+  // readUInt32LE stays unsigned even when the magic has bit 31 set.
   if (buf.readUInt32LE(APP_DESC_OFFSET) !== APP_DESC_MAGIC) return null;
   const cstr = (start, len) => {
-    const end = Math.min(buf.length, start + len);
-    let s = buf.subarray(start, end).toString('utf8');
-    const nul = s.indexOf('\0');
-    if (nul >= 0) s = s.slice(0, nul);
-    return s.trim();
+    const bytes = buf.subarray(start, start + len);
+    const nul = bytes.indexOf(0);
+    return nul < 0 ? null : bytes.subarray(0, nul).toString('utf8');
   };
-  return {
-    version: cstr(APP_DESC_OFFSET + 16, 32),
-    project: cstr(APP_DESC_OFFSET + 48, 32),
-  };
+  const version = cstr(APP_DESC_OFFSET + 16, 32);
+  const project = cstr(APP_DESC_OFFSET + 48, 32);
+  return version && project ? { version, project } : null;
+}
+
+/** Walk segment headers safely and verify the ESP image's XOR checksum. */
+function verifyImageChecksum(buf) {
+  const header = validateImageHeader(buf);
+  if (!header.ok) return header;
+  if (buf[1] < 1 || buf[1] > 16) return { ok: false, error: 'invalid image segment count' };
+  if (buf[23] !== 0 && buf[23] !== 1) return { ok: false, error: 'invalid hash_appended flag' };
+  let offset = 24, checksum = 0xEF;
+  for (let n = 0; n < buf[1]; n++) {
+    if (offset + 8 > buf.length) return { ok: false, error: 'truncated segment header' };
+    const end = offset + 8 + buf.readUInt32LE(offset + 4);
+    offset += 8;
+    if (end > buf.length) return { ok: false, error: 'truncated segment data' };
+    for (; offset < end; offset++) checksum ^= buf[offset];
+  }
+  // Checksum is the final byte before the next 16-byte boundary; footer
+  // padding is not XORed, but is included in the appended SHA-256.
+  const checksumOffset = Math.ceil((offset + 1) / 16) * 16 - 1;
+  const expectedSize = checksumOffset + 1 + (buf[23] ? 32 : 0);
+  if (buf.length !== expectedSize) return { ok: false, error: 'truncated image footer or unexpected trailing data' };
+  if (buf[checksumOffset] !== checksum) return { ok: false, error: 'image checksum does not match segment data' };
+  return { ok: true };
 }
 
 /** If the image declares an appended SHA-256 (header flag 0x17), verify it. */
@@ -69,6 +92,24 @@ function verifyAppendedHash(buf) {
     return { ok: false, error: 'appended SHA-256 does not match the image contents' };
   }
   return { ok: true };
+}
+
+/** Common upload/CLI policy: structure, integrity and embedded identity. */
+function validateApplicationImage(buf) {
+  const checksum = verifyImageChecksum(buf);
+  if (!checksum.ok) return checksum;
+  const hash = verifyAppendedHash(buf);
+  if (!hash.ok) return hash;
+  const meta = parseImageMeta(buf);
+  if (!meta) return { ok: false, error: 'image has no readable app descriptor (version/project) — is it an EnergyAnalyzer build?' };
+  if (meta.project !== 'EnergyAnalyzer') {
+    return { ok: false, error: `project is "${meta.project}", expected "EnergyAnalyzer"` };
+  }
+  const match = /^[0-9]{1,5}(?:\.[0-9]{1,5}){2}$/.exec(meta.version);
+  if (!match || match[0] !== meta.version || meta.version.split('.').some(n => Number(n) > 65535)) {
+    return { ok: false, error: `version "${meta.version}" must have three numeric components in 0..65535` };
+  }
+  return { ok: true, meta };
 }
 
 /** Compare two strict-semver versions; 1 = a newer, 0 = equal, -1 = a older. */
@@ -152,6 +193,7 @@ function activateRelease(otaDir, meta) {
 
 module.exports = {
   OTA_SIZE_CAP, OTA_SEMVER, ESP32S3_CHIP_ID,
-  sha256hex, validateImageHeader, parseImageMeta, verifyAppendedHash,
+  sha256hex, validateImageHeader, parseImageMeta, verifyImageChecksum, verifyAppendedHash,
+  validateApplicationImage,
   compareVersions, stageRelease, activateRelease,
 };

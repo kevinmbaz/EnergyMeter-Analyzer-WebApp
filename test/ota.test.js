@@ -8,6 +8,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 const crypto = require('node:crypto');
 const { spawnSync } = require('node:child_process');
+const { makeImage } = require('./helpers/esp-image');
 
 const SERVER = path.join(__dirname, '..', 'server.js');
 const CLI = path.join(__dirname, '..', 'scripts', 'publish_ota.js');
@@ -15,15 +16,8 @@ const OTA_SIZE_CAP = 0x3f0000;
 
 function tmpdir() { return fs.mkdtempSync(path.join(os.tmpdir(), 'em-ota-')); }
 
-// Minimal syntactically valid ESP32-S3 application image header + payload.
-function makeBin(size = 4096, chipId = 0x0009, magic = 0xE9) {
-  const buf = Buffer.alloc(Math.max(size, 0x18));
-  buf[0] = magic;        // esp_image_header_t magic
-  buf[1] = 1;            // segment count
-  buf.writeUInt32LE(0x40380000, 4); // entry point
-  buf.writeUInt16LE(chipId, 12);
-  for (let i = 0x18; i + 4 <= buf.length; i += 4) buf.writeUInt32LE(i, i);
-  return buf.subarray(0, size);
+function makeBin(size = 4096, chipId = 0x0009, magic = 0xE9, version = '1.3.1') {
+  return makeImage(size, { chipId, magic, version });
 }
 
 function sha256(buf) { return crypto.createHash('sha256').update(buf).digest('hex'); }
@@ -168,7 +162,7 @@ test('the last reported firmware version is captured from the User-Agent', async
   const otaDir = tmpdir();
   publishFixture(otaDir);
   const h = serverHarness({ OTA_TOKEN: 'test-token', OTA_DIR: otaDir });
-  await h.getJSON('/api/firmware/manifest', AUTH({ 'User-Agent': 'EnergyAnalyzer-OTA/1.3.0 (esp32s3)' }));
+  await h.getJSON('/api/firmware/manifest', AUTH({ 'User-Agent': 'EnergyAnalyzer-OTA/1.3.0' }));
   const s = await h.getJSON('/api/status');
   assert.equal(s.body.ota.reported_version, '1.3.0');
   assert.ok(s.body.ota.reported_at > 0);
@@ -253,6 +247,12 @@ test('publish CLI rejects bad image headers and metadata', () => {
     ['bad magic', { bin: makeBin(4096, 0x0009, 0x00) }],
     ['wrong chip id', { bin: makeBin(4096, 0x0000) }],
     ['sha mismatch', { meta: { sha256: '0'.repeat(64) } }],
+    ['image checksum mismatch', { bin: makeImage(8192, { version: '1.3.1', badChecksum: true }) }],
+    ['appended SHA mismatch', { bin: makeImage(8192, { version: '1.3.1', badHash: true }) }],
+    ['missing descriptor', { bin: makeImage(8192, { version: '1.3.1', descriptorMagic: 0 }) }],
+    ['wrong embedded project', { bin: makeImage(8192, { version: '1.3.1', project: 'OtherProject' }) }],
+    ['wrong manifest project', { meta: { project: 'OtherProject' } }],
+    ['embedded version mismatch', { bin: makeImage(8192, { version: '1.3.2' }) }],
     ['size mismatch', { meta: { size: 1 } }],
     ['oversize binary', { bin: makeBin(OTA_SIZE_CAP + 1) }],
     ['non-semver version', { meta: { version: '1.3' } }],
@@ -292,7 +292,7 @@ test('publish CLI retains old releases and switches the active manifest', () => 
   const otaDir = path.join(dir, 'ota');
   const a = writeInput(dir, { meta: { version: '1.3.1' } });
   assert.equal(runCli([a.binPath, a.manifestPath, '--ota-dir', otaDir]).status, 0);
-  const b = writeInput(dir, { bin: makeBin(6000), meta: { version: '1.3.2' } });
+  const b = writeInput(dir, { bin: makeBin(6000, 9, 0xE9, '1.3.2'), meta: { version: '1.3.2' } });
   assert.equal(runCli([b.binPath, b.manifestPath, '--ota-dir', otaDir]).status, 0);
   assert.ok(fs.existsSync(path.join(otaDir, 'releases', '1.3.1', 'firmware.bin')));
   assert.ok(fs.existsSync(path.join(otaDir, 'releases', '1.3.2', 'firmware.bin')));

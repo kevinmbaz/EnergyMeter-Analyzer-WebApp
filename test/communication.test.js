@@ -141,15 +141,31 @@ test('legacy push recovery clears old native meter faults and starts a fresh hea
   assert.equal((await h.get('/api/status')).body.device.health.code, 'esp32_offline');
 });
 
-test('pull failures are distinct from meter faults and do not override a healthy push feed', async () => {
+test('a missed pull preserves recent contact and does not override a healthy push feed', async () => {
   const h = serverHarness();
   h.run(`fetch = async () => ({ok: true, json: async () => ({meter: ${JSON.stringify(meter())}})})`);
   await h.run('pollEsp32()');
-  assert.equal((await h.get('/api/status')).body.device.health.code, 'ok');
+  const before = (await h.get('/api/readings')).body;
+  h.advance(2000);
   h.run('fetch = async () => { throw new Error("connection refused"); }');
   await h.run('pollEsp32()');
-  assert.equal((await h.get('/api/status')).body.device.health.code, 'esp32_offline');
-  h.ingest(meter({ sequence: 2 }));
+  const missed = (await h.get('/api/readings')).body;
+  assert.equal(missed.meta.device.health.code, 'ok');
+  assert.equal(missed.meta.device.connected, true);
+  assert.equal(missed.meta.device.stale, false);
+  assert.equal(missed.meta.device.last_seen, before.meta.device.last_seen);
+  assert.equal(missed.meta.device.last_error, 'connection refused');
+  assert.deepEqual(missed.sample, before.sample);
+  h.advance(2000);
+  h.run(`fetch = async () => ({ok: true, json: async () => ({meter: ${JSON.stringify(meter({ sequence: 2 }))}})})`);
+  await h.run('pollEsp32()');
+  const recovered = (await h.get('/api/readings')).body;
+  assert.equal(recovered.meta.device.health.code, 'ok');
+  assert.equal(recovered.meta.device.last_error, null);
+  assert.equal(recovered.sample.seq, 2);
+  assert.ok(recovered.sample.tot.e_wh > before.sample.tot.e_wh);
+  h.ingest(meter({ sequence: 3 }));
+  h.run('fetch = async () => { throw new Error("connection refused"); }');
   await h.run('pollEsp32()');
   const { body } = await h.get('/api/status');
   assert.equal(body.device.health.code, 'ok');
@@ -207,6 +223,50 @@ test('negative (exporting) power does not reduce accumulated import energy', asy
   const { body } = await h.get('/api/readings');
   assert.equal(body.sample.tot.e_wh, 0);
   assert.equal(body.sample.l1.e_wh, 0);
+});
+
+test('ESP32 contact expires only after 8 seconds for push, pull and legacy ingestion', async () => {
+  for (const feed of ['push', 'pull', 'legacy']) {
+    const h = serverHarness();
+    const report = async sequence => {
+      if (feed === 'push') h.ingest(meter({ sequence }));
+      else if (feed === 'pull') {
+        h.run(`fetch = async () => ({ok: true, json: async () => ({meter: ${JSON.stringify(meter({ sequence }))}})})`);
+        await h.run('pollEsp32()');
+      } else {
+        await h.run('handleIngest({headers: {}}, {writeHead() {}, end() {}}, {phases: {l1: {p: 100}, l2: {p: 200}, l3: {p: 300}}})');
+      }
+    };
+    await report(1);
+    const before = (await h.get('/api/readings')).body;
+    h.run('fetch = async () => { throw new Error("request timed out"); }');
+    h.advance(7999);
+    if (feed === 'pull') await h.run('pollEsp32()');
+    assert.equal((await h.get('/api/status')).body.device.health.code, 'ok', feed);
+    h.advance(1);
+    if (feed === 'pull') await h.run('pollEsp32()');
+    assert.equal((await h.get('/api/status')).body.device.connected, true, feed);
+    h.advance(1);
+    if (feed === 'pull') await h.run('pollEsp32()');
+    const lost = (await h.get('/api/readings')).body;
+    assert.equal(lost.meta.device.timeout_ms, 8000, feed);
+    assert.equal(lost.meta.device.connected, false, feed);
+    assert.equal(lost.meta.device.health.code, 'esp32_offline', feed);
+    assert.equal(lost.meta.device.last_seen, before.meta.device.last_seen, feed);
+    assert.deepEqual(lost.sample, before.sample, feed);
+    assert.equal(lost.meta.buffers.sec, before.meta.buffers.sec, feed);
+    await report(2);
+    const recovered = (await h.get('/api/readings')).body;
+    assert.equal(recovered.meta.device.health.code, 'ok', feed);
+    assert.equal(recovered.meta.device.last_error, null, feed);
+    assert.equal(recovered.sample.tot.e_wh, before.sample.tot.e_wh, feed);
+    h.advance(6000);
+    await report(3);
+    h.advance(6000);
+    assert.equal((await h.get('/api/status')).body.device.health.code, 'ok', feed);
+    h.advance(2001);
+    assert.equal((await h.get('/api/status')).body.device.health.code, 'esp32_offline', feed);
+  }
 });
 
 test('loss of ESP32 contact is offline, not just a generic stale meter', async () => {

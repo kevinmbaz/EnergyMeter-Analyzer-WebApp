@@ -7,33 +7,13 @@ const os = require('node:os');
 const path = require('node:path');
 const vm = require('node:vm');
 const crypto = require('node:crypto');
+const { makeImage: makeBin } = require('./helpers/esp-image');
 
 const SERVER = path.join(__dirname, '..', 'server.js');
 const OTA_SIZE_CAP = 0x3f0000;
 
 function tmpdir() { return fs.mkdtempSync(path.join(os.tmpdir(), 'em-otaweb-')); }
 
-// Syntactically valid ESP32-S3 application image with a real app descriptor:
-// header (magic 0xE9, chip 0x0009) + app_desc at 0x30 (magic 0xABCD5432,
-// version @ +16, project @ +48). Optional appended SHA-256 per header flag 0x17.
-function makeBin(size = 8192, opts = {}) {
-  const buf = Buffer.alloc(Math.max(size, 0x80));
-  buf[0] = opts.magic ?? 0xE9;
-  buf[1] = 1; // segment count
-  buf.writeUInt32LE(0x40380000, 4); // entry point
-  buf.writeUInt16LE(opts.chipId ?? 0x0009, 12);
-  buf[0x17] = opts.hashAppended ? 1 : 0;
-  buf.writeUInt32LE(0xABCD5432, 0x30); // app_desc magic
-  buf.write(opts.version ?? '1.4.0', 0x40, 'utf8');  // version[32]
-  buf.write(opts.project ?? 'EnergyAnalyzer', 0x60, 'utf8'); // project[32]
-  if (opts.hashAppended) {
-    const payload = buf.subarray(0, size - 32);
-    const h = crypto.createHash('sha256').update(payload).digest();
-    if (opts.badHash) h[0] ^= 0xff;
-    h.copy(buf, size - 32);
-  }
-  return buf.subarray(0, size);
-}
 
 function sha256(buf) { return crypto.createHash('sha256').update(buf).digest('hex'); }
 
@@ -104,7 +84,8 @@ test('upload rejects images that fail validation', async () => {
     ['wrong chip id', makeBin(8192, { chipId: 0x0000 })],
     ['wrong project', makeBin(8192, { project: 'OtherProject' })],
     ['non-semver version', makeBin(8192, { version: '1.4' })],
-    ['missing app descriptor', (() => { const b = makeBin(8192); b.writeUInt32LE(0, 0x30); return b; })()],
+    ['missing app descriptor', makeBin(8192, { descriptorMagic: 0 })],
+    ['image checksum mismatch', makeBin(8192, { badChecksum: true })],
     ['appended hash mismatch', makeBin(8192, { hashAppended: true, badHash: true })],
   ];
   for (const [name, bin] of cases) {
@@ -124,7 +105,7 @@ test('oversize uploads are rejected with 413', async () => {
 test('upload stages the release without touching the manifest', async () => {
   const otaDir = tmpdir();
   const h = serverHarness({ OTA_DIR: otaDir });
-  const bin = makeBin(9000, { version: '1.4.0' });
+  const bin = makeBin(1307664, { version: '1.4.0' });
   const r = await h.upload(bin);
   assert.equal(r.status, 200, r.body.toString());
   const d = JSON.parse(r.body.toString());
@@ -219,15 +200,15 @@ test('device version reporting and download tracking feed the status', async () 
   await h.upload(bin);
   await h.postJSON('/api/ota/install', { version: '1.4.0' });
   // old device reports 1.3.9 on the manifest request, then downloads
-  const m = await h.getJSON('/api/firmware/manifest', AUTH({ 'User-Agent': 'EnergyAnalyzer-OTA/1.3.9 (esp32s3)' }));
+  const m = await h.getJSON('/api/firmware/manifest', AUTH({ 'User-Agent': 'EnergyAnalyzer-OTA/1.3.9' }));
   assert.equal(m.body.version, '1.4.0');
-  assert.equal((await h.get('/firmware/1.4.0/firmware.bin', AUTH({ 'User-Agent': 'EnergyAnalyzer-OTA/1.3.9 (esp32s3)' }))).status, 200);
+  assert.equal((await h.get('/firmware/1.4.0/firmware.bin', AUTH({ 'User-Agent': 'EnergyAnalyzer-OTA/1.3.9' }))).status, 200);
   const s = await h.getJSON('/api/status');
   assert.equal(s.body.ota.reported_version, '1.3.9');
   assert.equal(s.body.ota.downloads.count, 1);
   assert.ok(s.body.ota.downloads.last_at > 0);
   // device reboots on the new firmware and reports it
-  await h.getJSON('/api/firmware/manifest', AUTH({ 'User-Agent': 'EnergyAnalyzer-OTA/1.4.0 (esp32s3)' }));
+  await h.getJSON('/api/firmware/manifest', AUTH({ 'User-Agent': 'EnergyAnalyzer-OTA/1.4.0' }));
   const s2 = await h.getJSON('/api/status');
   assert.equal(s2.body.ota.reported_version, '1.4.0');
   assert.equal(s2.body.ota.reported_version, s2.body.ota.active_version);
@@ -241,20 +222,20 @@ test('ingest and dashboard stay available when OTA web flow is used', async () =
   assert.equal(s.body.ota.token_configured, true);
 });
 
-test('device firmware version is captured from ingest pushes and plain EnergyAnalyzer UAs', async () => {
+test('unauthenticated ingest User-Agents cannot set a trusted running version', async () => {
   const h = serverHarness({ OTA_DIR: tmpdir() });
   await h.request('POST', '/api/ingest', {
     headers: { 'Content-Type': 'application/json', 'User-Agent': 'EnergyAnalyzer-OTA/2.0.0 (esp32s3)' },
     body: '{}',
   });
   let s = await h.getJSON('/api/status');
-  assert.equal(s.body.ota.reported_version, '2.0.0');
-  assert.ok(s.body.ota.reported_at > 0);
-  // plain EnergyAnalyzer/<version> (no -OTA suffix) is accepted too
+  assert.equal(s.body.ota.reported_version, null);
+  assert.equal(s.body.ota.reported_at, null);
+  // Neither a legacy UA nor an unauthenticated request is a trusted report.
   await h.request('POST', '/api/ingest', {
     headers: { 'Content-Type': 'application/json', 'User-Agent': 'EnergyAnalyzer/2.1.0 (esp32s3)' },
     body: '{}',
   });
   s = await h.getJSON('/api/status');
-  assert.equal(s.body.ota.reported_version, '2.1.0');
+  assert.equal(s.body.ota.reported_version, null);
 });

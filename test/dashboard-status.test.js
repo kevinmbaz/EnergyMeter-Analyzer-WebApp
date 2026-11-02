@@ -72,6 +72,18 @@ test('phase chart series use their own colors, not a shared accent fallback', ()
     'L1/L2/L3 series must render in three distinct colors');
 });
 
+test('ESP32 firmware stays visible before the device reports its version', () => {
+  const data = readings('ok', 'ok', 'ESP32 connected; meter readings are live.');
+  const h = clientHarness(data);
+  for (const version of [null, '2.1.0', null]) {
+    data.meta.ota = { reported_version: version, reported_at: version ? Date.now() : null };
+    h.updateSourcePills(data);
+    assert.equal(h.get('sideFirmware').hidden, false);
+    assert.equal(h.get('sideFirmware').textContent,
+      version ? `ESP32 firmware: v${version}` : 'ESP32 firmware: Not reported');
+  }
+});
+
 test('reverse power flow is called out, not shown as zero', () => {
   const data = readings('ok', 'ok', 'ESP32 connected; meter readings are live.');
   data.sample = { t: Date.now(), seq: 1, freq: 50,

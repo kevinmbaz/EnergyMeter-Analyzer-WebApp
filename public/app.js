@@ -10,6 +10,10 @@
   const clamp = (x, lo, hi) => Math.min(hi, Math.max(lo, x));
 
   const PHASES = ['l1', 'l2', 'l3'];
+  const RANGE_SPANS = { '1m': 60e3, '5m': 300e3, live: 600e3, '15m': 900e3, '30m': 1800e3,
+    '1h': 3600e3, '6h': 6 * 3600e3, '24h': 86400e3, '7d': 7 * 86400e3,
+    '30d': 30 * 86400e3, '90d': 90 * 86400e3, '180d': 180 * 86400e3,
+    '1y': 365 * 86400e3, '2y': 2 * 365 * 86400e3, '5y': 5 * 365 * 86400e3 };
   const PHASE_COLOR_KEY = { l1: '--p1', l2: '--p2', l3: '--p3', total: '--muted', accent: '--accent' };
 
   const S = {
@@ -25,10 +29,14 @@
     provisionalShown: false,
     deviceBanner: false,
     otaStagedVersion: null,
+    serial: serialState(''),
     rings: { power: [], energy: [], pf: [], freq: [], current: [], imbalance: [] },
     chartSpecs: [],          // {chart, series:[{phase,key,colorKey,label,...}]}
     lastHistory: null,
     lastHistoryFetch: 0,
+    historyRequest: 0,
+    historyPending: false,
+    historyWindow: null,
     timer: null,
     noticeTimer: null,
   };
@@ -47,7 +55,12 @@
     const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
     if (spanMs <= 2 * 3600e3) return `${hm}:${String(d.getSeconds()).padStart(2, '0')}`;
     if (spanMs <= 30 * 3600e3) return hm;
-    return `${d.toLocaleDateString(undefined, { weekday: 'short' })} ${hm}`;
+    if (spanMs <= 14 * 86400e3) return `${d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })} ${hm}`;
+    if (spanMs <= 180 * 86400e3) return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+    return d.toLocaleDateString(undefined, { month: 'short', year: 'numeric' });
+  }
+  function fmtTooltipTime(t) {
+    return new Date(t).toLocaleString(undefined, { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' });
   }
   function fmtClock(t) {
     const d = new Date(t);
@@ -84,12 +97,56 @@
     return c;
   };
 
+  const CURSOR_EVENTS = ['mousemove', 'mouseout', 'click', 'touchstart', 'touchmove', 'touchend', 'touchcancel'];
+  const chartCursor = {
+    id: 'chart-cursor', events: CURSOR_EVENTS,
+    afterEvent(chart, args) {
+      const event = args.event, area = chart.chartArea;
+      const type = event.native?.type || event.type;
+      if (type === 'touchend' || type === 'touchcancel') chart.$cursorTouchUntil = Date.now() + 1000;
+      // Browsers synthesize mouse/click events after a tap. Do not revive the
+      // released crosshair, including when Chart.js replays that event on update.
+      const touchMouse = !type.startsWith('touch') && (event.native?.sourceCapabilities?.firesTouchEvents
+        || Date.now() < (chart.$cursorTouchUntil || 0) || (args.replay && chart.$cursorTouchUntil));
+      if (!type.startsWith('touch') && !touchMouse) chart.$cursorTouchUntil = 0;
+      const inside = area && args.inChartArea !== false && !touchMouse
+        && !['mouseout', 'touchend', 'touchcancel'].includes(type)
+        && finite(event.x) && finite(event.y)
+        && event.x >= area.left && event.x <= area.right
+        && event.y >= area.top && event.y <= area.bottom;
+      const next = inside ? { x: event.x, y: event.y } : null;
+      if (chart.$cursor?.x !== next?.x || chart.$cursor?.y !== next?.y) {
+        chart.$cursor = next;
+        args.changed = true;
+      }
+    },
+    afterDatasetsDraw(chart) {
+      const point = chart.$cursor, area = chart.chartArea;
+      if (!point || !area || point.x < area.left || point.x > area.right
+          || point.y < area.top || point.y > area.bottom) return;
+      const ctx = chart.ctx;
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(area.left, area.top, area.right - area.left, area.bottom - area.top);
+      ctx.clip();
+      ctx.strokeStyle = cssVar('--muted');
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      ctx.moveTo(point.x, area.top); ctx.lineTo(point.x, area.bottom);
+      ctx.moveTo(area.left, point.y); ctx.lineTo(area.right, point.y);
+      ctx.stroke();
+      ctx.restore();
+    },
+  };
+
   function baseChartOptions() {
     const c = chartPalette();
     return {
       maintainAspectRatio: false,
       animation: { duration: 350 },
-      interaction: { mode: 'index', intersect: false },
+      interaction: { mode: 'index', axis: 'x', intersect: false },
+      events: CURSOR_EVENTS,
       plugins: {
         legend: { display: false },
         tooltip: {
@@ -97,8 +154,13 @@
           borderColor: c.line, borderWidth: 1, padding: 10, cornerRadius: 8,
           titleFont: { weight: '600', size: 11.5 }, bodyFont: { size: 12 },
           callbacks: {
-            title: items => items.length ? fmtAxisTime(items[0].parsed.x, S.lastHistorySpan || 600e3) : '',
-            label: ctx => ` ${ctx.dataset.label}: ${ctx.dataset.unitFmt ? ctx.dataset.unitFmt(ctx.parsed.y) : ctx.parsed.y}`,
+            title: items => items.length ? fmtTooltipTime(items[0].parsed.x) : '',
+            label: ctx => {
+              const formatter = ctx.dataset.unitFmt, value = ctx.parsed.y;
+              const text = !finite(value) ? '—' : typeof formatter === 'function'
+                ? formatter(value) : formatter?.format ? formatter.format(value) : String(value);
+              return ` ${ctx.dataset.label}: ${text}${ctx.dataset.unitLabel ? ` ${ctx.dataset.unitLabel}` : ''}`;
+            },
           },
         },
       },
@@ -136,6 +198,7 @@
   }
 
   function pick(p, phase, key) {
+    if (key === 'freq') return p.freq;
     return phase === 'total' ? p.tot[key] : p[phase][key];
   }
 
@@ -146,7 +209,7 @@
     Object.assign(opts.scales, extraOptions.scales || {});
     Object.assign(opts.plugins, extraOptions.plugins || {});
     opts.animation = { duration: extraOptions.noAnim ? 0 : 350 };
-    const chart = new Chart(el, { type: extraOptions.type || 'line', data: { datasets: series.map(s => ({ ...s })) }, options: opts });
+    const chart = new Chart(el, { type: extraOptions.type || 'line', data: { datasets: series.map(s => ({ ...s })) }, options: opts, plugins: [chartCursor] });
     const spec = { chart, series: series.map(s => ({ phase: s.phaseMeta, colorKey: s.colorKey, fill: !!s.fill })) };
     S.chartSpecs.push(spec);
     return chart;
@@ -156,6 +219,7 @@
     series.forEach((s, i) => {
       const ds = chart.data.datasets[i];
       ds.data = points.map(p => ({ x: p.t, y: pick(p, s.phase, s.key) }));
+      ds.pointRadius = points.length === 1 ? 3 : 0;
     });
     chart.update('none');
   }
@@ -603,7 +667,7 @@
     if (id === 'energyBarChart') {
       const c = chartPalette();
       const bar = new Chart($('energyBarChart'), {
-        type: 'bar',
+        type: 'bar', plugins: [chartCursor],
         data: {
           datasets: PHASES.map((ph, i) => ({
             label: ph.toUpperCase(),
@@ -616,14 +680,15 @@
         },
         options: {
           maintainAspectRatio: false, animation: { duration: 350 },
-          interaction: { mode: 'index', intersect: false },
+          interaction: { mode: 'index', axis: 'x', intersect: false },
+          events: CURSOR_EVENTS,
           plugins: {
             legend: { display: false },
             tooltip: {
               backgroundColor: c.panel, titleColor: c.ink, bodyColor: c.muted,
               borderColor: c.line, borderWidth: 1, padding: 10, cornerRadius: 8,
               callbacks: {
-                title: items => items.length && items[0].raw ? fmtAxisTime(items[0].raw.x, S.lastHistorySpan || 600e3) : '',
+                title: items => items.length && items[0].raw ? fmtTooltipTime(items[0].raw.x) : '',
                 label: ctx => ` ${ctx.dataset.label}: ${(nf(3, 3)).format(ctx.parsed.y)} kWh`,
               },
             },
@@ -650,15 +715,12 @@
       return ds;
     });
     // assign unit formatters + y-axis titles per chart (axis shows raw units)
-    const unitLabel = id.includes('Power') || id.includes('DChart') ? 'W'
+    const unitLabel = id.startsWith('voltage') ? 'V' : id.startsWith('current') ? 'A'
       : id.includes('QChart') ? 'var' : id.includes('SChart') ? 'VA'
-      : id.includes('voltage') ? 'V' : id.includes('current') ? 'A'
-      : id.includes('freq') ? 'Hz' : id.includes('pf') ? '' : 'W';
-    const unit = id.includes('Power') || id.includes('DChart') ? fmt.W
-      : id.includes('QChart') ? fmt.W : id.includes('SChart') ? fmt.W
-      : id.includes('voltage') ? fmt.V : id.includes('current') ? fmt.A
-      : id.includes('pf') ? fmt.pf : id.includes('freq') ? fmt.Hz : fmt.W;
-    ds.forEach(d => { d.unitFmt = unit; });
+      : id.startsWith('freq') ? 'Hz' : id.startsWith('pf') ? '' : 'W';
+    const unit = unitLabel === 'V' ? fmt.V : unitLabel === 'A' ? fmt.A
+      : unitLabel === 'Hz' ? fmt.Hz : unitLabel === '' ? fmt.pf : fmt.W;
+    ds.forEach(d => { d.unitFmt = unit; d.unitLabel = unitLabel; });
     const chart = makeChart(id, ds);
     if (chart && unitLabel) {
       chart.options.scales.y.title = { display: true, text: unitLabel, color: cssVar('--faint'), font: { size: 10.5 } };
@@ -680,30 +742,51 @@
     ensureChartsFor('overview');
   }
 
+  function energyBucketSpec(range) {
+    const span = RANGE_SPANS[range] || RANGE_SPANS.live;
+    if (span > 180 * 86400e3) return { unit: 'month', note: 'calendar-month buckets · UTC' };
+    if (span > 90 * 86400e3) return { unit: 'week', sizeMs: 7 * 86400e3, note: '7-day buckets · UTC' };
+    if (span > 86400e3) return { unit: 'day', sizeMs: 86400e3, note: 'daily buckets · UTC' };
+    if (span > 3600e3) return { unit: 'hour', sizeMs: 3600e3, note: 'hourly buckets' };
+    return { unit: 'minute', sizeMs: 60e3, note: '60 s buckets' };
+  }
+
   function energyBuckets(points, range) {
     if (!points || points.length < 2) return [];
-    const perHour = ['6h', '24h', '7d'].includes(range);
-    const sizeMs = perHour ? 3600e3 : 60e3;
+    const spec = energyBucketSpec(range);
     const buckets = [];
     let cur = null;
     for (let i = 1; i < points.length; i++) {
       const p = points[i], prev = points[i - 1];
-      const t0 = Math.floor(p.t / sizeMs) * sizeMs;
+      const date = new Date(p.t);
+      const t0 = spec.unit === 'month' ? Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1)
+        : Math.floor(p.t / spec.sizeMs) * spec.sizeMs;
+      const t1 = spec.unit === 'month' ? Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 1) : t0 + spec.sizeMs;
       if (!cur || cur.t0 !== t0) {
         if (cur) buckets.push(cur);
-        cur = { t0, t1: t0 + sizeMs, e: { l1: 0, l2: 0, l3: 0 } };
+        cur = { t0, t1, e: { l1: 0, l2: 0, l3: 0 } };
       }
-      for (const ph of PHASES) cur.e[ph] += p[ph].e_wh - prev[ph].e_wh;
-      cur.t1 = t0 + sizeMs;
+      for (const ph of PHASES) {
+        const value = p[ph].e_wh, previous = prev[ph].e_wh;
+        // Unknown counters and a reset are not negative consumption.
+        if (finite(value) && finite(previous) && value >= previous) cur.e[ph] += value - previous;
+      }
     }
     if (cur) buckets.push(cur);
     return buckets;
+  }
+
+  function setChartWindow(chart) {
+    if (!S.historyWindow) return;
+    chart.options.scales.x.min = S.historyWindow.from;
+    chart.options.scales.x.max = S.historyWindow.to;
   }
 
   function updateCharts(points) {
     for (const [id, chart] of charts) {
       if (id === 'energyBarChart' || !chart) continue;
       const series = chartDefs[id];
+      setChartWindow(chart);
       updateChart(chart, series, points);
     }
     const bar = charts.get('energyBarChart');
@@ -712,25 +795,54 @@
     PHASES.forEach((ph, i) => {
       bar.data.datasets[i].data = buckets.map(b => ({ x: b.t0, y: b.e[ph] / 1000 }));
     });
+    setChartWindow(bar);
     bar.update('none');
-    $('energyChartTitle').textContent = ['live', '1h'].includes(S.range) ? 'Energy per minute' : 'Energy per hour';
-    $('energyChartSub').textContent = `kWh · ${['live', '1h'].includes(S.range) ? '60 s buckets' : 'hourly buckets'}`;
+    const bucketSpec = energyBucketSpec(S.range);
+    $('energyChartTitle').textContent = `Energy per ${bucketSpec.unit}`;
+    $('energyChartSub').textContent = `kWh · ${bucketSpec.note}`;
     updateEnergyStats(points);
   }
 
   async function fetchHistory(force = false) {
-    const liveRange = ['live', '1h'].includes(S.range);
-    if (!force && !liveRange && Date.now() - S.lastHistoryFetch < 15000) return;
+    if (!CHART_VIEWS[S.view] || (S.paused && !force) || (S.historyPending && !force)) return;
+    const range = S.range, span = RANGE_SPANS[range] || RANGE_SPANS.live;
+    const interval = span > 86400e3 ? 60000 : span > 3600e3 ? 15000 : S.pollMs;
+    if (!force && Date.now() - S.lastHistoryFetch < interval) return;
+    const request = ++S.historyRequest;
+    S.historyPending = true;
     S.lastHistoryFetch = Date.now();
+    const label = $('rangeSelect').selectedOptions?.[0]?.textContent || range;
+    $('historySummary').textContent = `Loading ${label} history…`;
+    $('historyStatus').dataset.state = 'loading';
     try {
-      const res = await fetch(`/api/history?range=${S.range}`, { cache: 'no-store', signal: AbortSignal.timeout(5000) });
+      const res = await fetch(`/api/history?range=${encodeURIComponent(range)}`, { cache: 'no-store', signal: AbortSignal.timeout(10000) });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
-      if (!Array.isArray(data.points)) return;
+      if (request !== S.historyRequest || range !== S.range) return;
+      if (!Array.isArray(data.points) || data.points.length > 720
+          || (data.range !== undefined && data.range !== range)
+          || data.points.some((p, i) => !p || !finite(p.t) || !p.l1 || !p.l2 || !p.l3 || !p.tot
+            || (i > 0 && p.t < data.points[i - 1].t))) throw new Error('invalid history response');
+      const to = finite(data.to) ? data.to : Date.now();
+      const from = finite(data.from) ? data.from : to - span;
+      if (to <= from || data.points.some(p => p.t < from || p.t > to)) throw new Error('invalid history window');
       S.lastHistory = data.points;
-      S.lastHistorySpan = data.points.length ? data.points[data.points.length - 1].t - data.points[0].t || 600e3 : 600e3;
+      S.lastHistorySpan = to - from;
+      S.historyWindow = { from, to };
       updateCharts(data.points);
-    } catch { /* banner handled by readings poll */ }
+      const count = data.points.length;
+      const coverage = count ? `${count} points · recorded ${fmtTooltipTime(data.points[0].t)} – ${fmtTooltipTime(data.points[count - 1].t)}`
+        : 'No recorded data in this time range. History appears as measurements are collected.';
+      $('historySummary').textContent = `${label} · ${coverage}${data.warning ? ` · ${data.warning}` : ''}`;
+      $('historyStatus').dataset.state = data.partial ? 'partial' : 'ready';
+    } catch (error) {
+      if (request === S.historyRequest && range === S.range) {
+        $('historySummary').textContent = `Unable to load ${label} history (${error.message || 'network error'}). Last chart data retained; retrying.`;
+        $('historyStatus').dataset.state = 'error';
+      }
+    } finally {
+      if (request === S.historyRequest) S.historyPending = false;
+    }
   }
 
   // ---------------------------------------------------------------- readings poll
@@ -791,6 +903,141 @@
       $('sideSource').textContent = 'Server offline';
       showNotice(`Unable to reach the server API (${err.message || 'network error'}). Last known values remain visible; retrying automatically.`);
     }
+  }
+
+  // ---------------------------------------------------------------- serial console
+
+  function serialState(device) {
+    return { device, after: 0, entries: [], lastBatch: null, pending: false,
+      paused: false, loaded: false, cleared: false, truncated: false,
+      hasMore: false, error: '', timer: null };
+  }
+
+  function renderSerialLogs() {
+    const serial = S.serial, output = $('serialOutput');
+    const text = serial.entries.map(batch => batch.text).join('');
+    if (output.textContent !== text) {
+      const top = output.scrollTop;
+      output.textContent = text; // Device output is untrusted; never use innerHTML.
+      output.scrollTop = $('serialAutoscroll').checked ? output.scrollHeight : top;
+    }
+    $('serialEmpty').hidden = serial.entries.length > 0;
+    $('serialEmpty').textContent = serial.cleared
+      ? 'Display cleared. New batches will appear here; saved logs remain on the server.'
+      : serial.pending ? 'Loading stored console logs…'
+        : 'No console logs received for this device yet. Waiting for ESP32 log uploads.';
+    const pill = $('serialPill');
+    pill.textContent = serial.paused ? 'Logs paused' : serial.error ? 'Logs unavailable'
+      : serial.pending && !serial.loaded ? 'Loading logs' : serial.hasMore ? 'Loading history'
+        : serial.lastBatch ? 'Following logs' : 'Waiting for logs';
+    pill.className = `pill ${serial.paused ? 'warn' : serial.error ? 'bad' : serial.lastBatch ? 'good' : ''}`;
+    $('serialMessage').hidden = !serial.error;
+    $('serialMessage').textContent = serial.error;
+    $('serialPause').textContent = serial.paused ? 'Resume logs' : 'Pause logs';
+    $('serialPause').setAttribute('aria-pressed', String(serial.paused));
+    $('serialRefresh').textContent = serial.pending ? 'Reading…' : 'Refresh';
+    $('serialRefresh').disabled = serial.pending;
+    $('serialClear').disabled = serial.pending || !serial.entries.length;
+    $('serialLoad').disabled = serial.pending;
+    const last = serial.lastBatch;
+    $('serialMeta').textContent = last
+      ? `${last.device_name} · firmware v${last.firmware_version} · boot ${last.boot_id} · sequence ${last.sequence} · reported dropped bytes: ${last.dropped_bytes} · received ${new Date(last.received_at).toLocaleString()}`
+      : 'No log batch received yet.';
+    $('serialSummary').textContent = `${serial.entries.length} batches shown${serial.truncated ? ' (display limited to the latest 200 loaded batches)' : ''} · refresh ${S.pollMs / 1000}s while Settings is open · Clear display does not delete saved logs.`;
+  }
+
+  async function pollSerialLogs(force = false) {
+    const serial = S.serial;
+    if (S.view !== 'settings' || document.hidden || serial.pending || (serial.paused && !force)) return;
+    clearTimeout(serial.timer);
+    serial.pending = true;
+    renderSerialLogs();
+    try {
+      const query = new URLSearchParams({ after: String(serial.after), limit: '100' });
+      if (serial.device) query.set('device', serial.device);
+      const response = await fetch(`/api/serial-log?${query}`, {
+        cache: 'no-store', headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(4500),
+      });
+      if (!response.ok) throw new Error(response.status === 403
+        ? 'Serial logs are private. Open this dashboard using the Jetson’s Tailscale address.'
+        : `Unable to load serial logs (HTTP ${response.status}). Retrying automatically.`);
+      const data = await response.json();
+      if (serial !== S.serial || (serial.paused && !force)) return;
+      let cursor = serial.after;
+      if (!data || !Array.isArray(data.batches) || data.batches.length > 200
+          || !Number.isSafeInteger(data.next_after) || data.next_after < cursor || typeof data.has_more !== 'boolean') {
+        throw new Error('The serial-log API returned an invalid response. Last displayed logs are retained.');
+      }
+      for (const batch of data.batches) {
+        if (!batch || !Number.isSafeInteger(batch.id) || batch.id <= cursor
+            || typeof batch.text !== 'string' || batch.text.length > 4096) {
+          throw new Error('The serial-log API returned an invalid batch. Last displayed logs are retained.');
+        }
+        cursor = batch.id;
+      }
+      if (data.next_after !== cursor || (data.has_more && cursor === serial.after)) {
+        throw new Error('The serial-log API returned an invalid cursor. Last displayed logs are retained.');
+      }
+      serial.entries.push(...data.batches);
+      if (data.batches.length) {
+        serial.lastBatch = data.batches[data.batches.length - 1];
+        serial.cleared = false;
+      }
+      if (serial.entries.length > 200) {
+        serial.entries = serial.entries.slice(-200);
+        serial.truncated = true;
+      }
+      serial.after = cursor;
+      serial.hasMore = data.has_more;
+      serial.loaded = true;
+      serial.error = '';
+    } catch (error) {
+      if (serial === S.serial) serial.error = error.message || 'Unable to load serial logs. Retrying automatically.';
+    } finally {
+      serial.pending = false;
+      if (serial === S.serial) {
+        renderSerialLogs();
+        if (serial.hasMore && !serial.paused && !serial.error) {
+          serial.timer = setTimeout(() => pollSerialLogs(), 100);
+        }
+      }
+    }
+  }
+
+  function resetSerialLogs(device) {
+    if (device && !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(device)) {
+      S.serial.error = 'Enter a valid device name: letters, digits, dots, underscores or hyphens.';
+      renderSerialLogs();
+      return;
+    }
+    clearTimeout(S.serial.timer);
+    S.serial = serialState(device);
+    renderSerialLogs();
+    return pollSerialLogs();
+  }
+
+  function bindSerialControls() {
+    $('serialDeviceForm').addEventListener('submit', event => {
+      event.preventDefault();
+      return resetSerialLogs($('serialDevice').value.trim());
+    });
+    $('serialPause').addEventListener('click', () => {
+      S.serial.paused = !S.serial.paused;
+      clearTimeout(S.serial.timer);
+      renderSerialLogs();
+      if (!S.serial.paused) return pollSerialLogs();
+    });
+    $('serialRefresh').addEventListener('click', () => pollSerialLogs(true));
+    $('serialClear').addEventListener('click', () => {
+      S.serial.entries = [];
+      S.serial.cleared = true;
+      S.serial.truncated = false;
+      renderSerialLogs();
+    });
+    $('serialAutoscroll').addEventListener('change', () => {
+      if ($('serialAutoscroll').checked) $('serialOutput').scrollTop = $('serialOutput').scrollHeight;
+    });
+    renderSerialLogs();
   }
 
   // ---------------------------------------------------------------- OTA panel
@@ -963,8 +1210,8 @@
     const agoS = ms => (ms == null ? '—' : `${Math.max(0, Math.round((Date.now() - ms) / 1000))} s ago`);
     const fw = meta && meta.ota ? meta.ota.reported_version : null;
     const fwEl = $('sideFirmware');
-    if (fw) { fwEl.textContent = `firmware v${fw}`; fwEl.hidden = false; }
-    else fwEl.hidden = true;
+    fwEl.textContent = fw ? `ESP32 firmware: v${fw}` : 'ESP32 firmware: Not reported';
+    fwEl.hidden = false;
     const rows = [
       ['Source', source === 'device' ? 'ESP32 device' : 'Built-in simulator'],
       ['Device firmware', fw ? `v${fw} · ${agoS(meta.ota.reported_at)}` : 'not reported yet'],
@@ -1004,6 +1251,7 @@
 
   async function loop() {
     await pollReadings(); // Keep fault feedback active even when charts are paused.
+    pollSerialLogs(); // Independent of the chart pause control; only active in Settings.
     if (!S.paused) await fetchHistory();
     S.timer = setTimeout(loop, S.pollMs);
   }
@@ -1018,7 +1266,7 @@
     quality: ['Power quality', 'Power factor, frequency and phase balance'],
     energy: ['Energy', 'Accumulated energy and bucket breakdown'],
     table: ['Live data', 'All measurement groups · updated every poll'],
-    settings: ['Settings', 'Data source, simulator and appearance'],
+    settings: ['Settings', 'ESP32 console, firmware, data source and appearance'],
   };
 
   function showView(name) {
@@ -1032,6 +1280,8 @@
     const [title, sub] = VIEW_META[name] || [name, ''];
     $('viewTitle').textContent = title;
     $('viewSubtitle').textContent = sub;
+    $('historyStatus').hidden = !CHART_VIEWS[name];
+    $('rangeWrap').hidden = !CHART_VIEWS[name];
     // create the view's charts only now that it is visible, then feed them.
     // Synchronous: Chart.js reads the container size itself (forcing layout),
     // and rAF can be throttled to never fire in background tabs.
@@ -1039,6 +1289,7 @@
     if (S.lastHistory) updateCharts(S.lastHistory);
     if (CHART_VIEWS[name]) fetchHistory(true);
     if (S.latest) updateEnergyStats(S.lastHistory);
+    if (name === 'settings') pollSerialLogs();
   }
 
   function applyPhaseVisibility() {
@@ -1051,10 +1302,12 @@
   }
 
   function bindControls() {
+    bindSerialControls();
     for (const btn of document.querySelectorAll('.nav-item')) {
       btn.addEventListener('click', () => showView(btn.dataset.view));
     }
     $('rangeSelect').addEventListener('change', e => {
+      if (!Object.hasOwn(RANGE_SPANS, e.target.value)) return;
       S.range = e.target.value;
       fetchHistory(true);
     });

@@ -37,10 +37,15 @@ const RAW_EXPORT_MAX_ROWS = 100000; // refuse raw CSV larger than this; use minu
 const ESP32_URL = process.env.ESP32_URL ?? 'http://energymeter.local/api/readings';
 const ESP32_POLL_MS = Math.max(1000, Number(process.env.ESP32_POLL_MS || 2000));
 const ESP32_TIMEOUT_MS = Number(process.env.ESP32_TIMEOUT_MS || 4000);
+// Connection grace period is independent of meter sample freshness.
+const ESP32_CONNECTION_TIMEOUT_MS = 8000;
 const DEVICE_STALE_MS = 15000;
 // Optional shared secret for POST /api/ingest (header: X-Ingest-Token).
 // Off by default; set when ingesting over a public network.
 const INGEST_TOKEN = process.env.INGEST_TOKEN || '';
+// Bind metadata to this ESP32, not the meter's Modbus slave address or a
+// caller-supplied identity. Each configured device retains its own DB row.
+const ESP32_DEVICE_ID = process.env.ESP32_DEVICE_ID || 'energymeter';
 
 // ---------------------------------------------------------------- OTA
 // Private pull-based firmware hosting for the ESP32. Fail closed: without
@@ -57,27 +62,55 @@ const OTA_UPLOAD_LIMIT = OTA_SIZE_CAP + 65536; // upload body cap with slack
 const OTA_PROJECT = 'EnergyAnalyzer';          // project name baked into app_desc
 const OTA_LAYOUT = 'energymeter-ota-v1';       // manifest layout for this feed
 
-// The ESP32 reports the firmware it is running through its User-Agent on any
-// request it makes (OTA polls and data pushes): EnergyAnalyzer-OTA/<version>.
-function otaVersionFromUA(ua) {
-  const m = /EnergyAnalyzer(?:-OTA)?\/([\d.]+)/.exec(String(ua || ''));
-  return m ? m[1] : null;
+// Running firmware is device-reported metadata, never the published OTA release.
+function validFirmwareVersion(value) {
+  if (typeof value !== 'string' || value.length > 17) return null;
+  const match = /^[0-9]{1,5}(?:\.[0-9]{1,5}){2}$/.exec(value);
+  if (!match || match[0] !== value || value.split('.').some(n => Number(n) > 65535)) return null;
+  return value;
 }
-function recordDeviceVersion(ua) {
-  const v = otaVersionFromUA(ua);
-  if (v && v !== state.otaReported.version) state.otaReported = { version: v, at: Date.now() };
+function otaVersionFromUA(ua) {
+  if (typeof ua !== 'string' || ua.length > 36) return null;
+  const m = /^EnergyAnalyzer-OTA\/(\d+\.\d+\.\d+)$/.exec(ua);
+  return m && m[0] === ua ? validFirmwareVersion(m[1]) : null;
+}
+function recordDeviceVersion(value, source) {
+  const version = validFirmwareVersion(value);
+  if (!version) return;
+  const at = Date.now();
+  if (db) {
+    db.prepare(`INSERT INTO device_firmware (device_id, version, reported_at, source)
+      VALUES (?, ?, ?, ?) ON CONFLICT(device_id) DO UPDATE SET
+      version = excluded.version, reported_at = excluded.reported_at, source = excluded.source`)
+      .run(ESP32_DEVICE_ID, version, at, source);
+  }
+  state.otaReported = { version, at, source };
+}
+function firmwareStatus(now = Date.now()) {
+  const report = state.otaReported;
+  const age = report.at === null ? null : Math.max(0, now - report.at);
+  return { device_id: ESP32_DEVICE_ID, version: report.version,
+    reported_at: report.at, source: report.source,
+    age_ms: age, stale: age === null || age >= DEVICE_STALE_MS };
 }
 // Absolute path: the vm test harness swaps `require`, so relative requires
 // must never be used for project files.
 const otaCore = require(path.join(__dirname, 'scripts', 'ota_core.js'));
+const serialLogs = require(path.join(__dirname, 'scripts', 'serial_logs.js'));
 
 // Never log or echo OTA_TOKEN anywhere. Tokens are compared as SHA-256 digests
 // with a constant-time comparison, so even the comparison time leaks nothing.
 function otaTokenMatches(provided) {
-  if (!OTA_TOKEN) return false;
+  return tokenMatches(OTA_TOKEN, provided);
+}
+function tokenMatches(secret, provided) {
+  if (!secret || typeof provided !== 'string') return false;
   const a = crypto.createHash('sha256').update(String(provided || '')).digest();
-  const b = crypto.createHash('sha256').update(OTA_TOKEN).digest();
+  const b = crypto.createHash('sha256').update(secret).digest();
   return crypto.timingSafeEqual(a, b);
+}
+function ingestTokenMatches(req) {
+  return tokenMatches(INGEST_TOKEN, req.headers['x-ingest-token'] || req.headers['x-api-key']);
 }
 
 function ip4ToInt(ip) {
@@ -142,7 +175,7 @@ function otaActiveInfo() {
 function handleOtaManifest(req, res) {
   if (!otaTokenMatches(req.headers['x-ota-token'])) return sendJSON(res, 401, { error: 'unauthorized' });
   if (!otaSourceAllowed(req.socket && req.socket.remoteAddress)) return sendJSON(res, 403, { error: 'forbidden' });
-  recordDeviceVersion(req.headers['user-agent']);
+  recordDeviceVersion(otaVersionFromUA(req.headers['user-agent']), 'ota.user-agent');
   const info = otaActiveInfo();
   if (!info.enabled) {
     const body = JSON.stringify({ enabled: false });
@@ -185,7 +218,7 @@ function handleOtaBinary(req, res, pathname) {
   state.otaDownloads.last_at = Date.now();
   const uaVer = otaVersionFromUA(req.headers['user-agent']);
   if (uaVer) state.otaDownloads.last_ua_version = uaVer;
-  recordDeviceVersion(req.headers['user-agent']);
+  recordDeviceVersion(uaVer, 'ota.user-agent');
   const buf = fs.readFileSync(info.binPath);
   // Exact Content-Length, no chunked transfer, no compression, no redirects.
   res.writeHead(200, {
@@ -206,13 +239,20 @@ function handleOtaBinary(req, res, pathname) {
 function readRawBody(req, limit) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    let size = 0;
+    let size = 0, exceeded = false;
     req.on('data', c => {
+      if (exceeded) return; // drain without buffering so an HTTP 413 can reach the client
       size += c.length;
-      if (size > limit) { reject(Object.assign(new Error('payload too large'), { status: 413 })); req.destroy(); return; }
+      if (size > limit) {
+        exceeded = true;
+        chunks.length = 0;
+        reject(Object.assign(new Error('payload too large'), { status: 413 }));
+        return;
+      }
       chunks.push(c);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => { if (!exceeded) resolve(Buffer.concat(chunks)); });
+    req.on('aborted', () => reject(new Error('request aborted')));
     req.on('error', reject);
   });
 }
@@ -225,20 +265,9 @@ async function handleOtaUpload(req, res) {
     if (buf.length > OTA_SIZE_CAP) {
       return sendJSON(res, 413, { error: `firmware is ${buf.length} bytes — exceeds the 0x${OTA_SIZE_CAP.toString(16)} OTA cap` });
     }
-    const header = otaCore.validateImageHeader(buf);
-    if (!header.ok) return sendJSON(res, 400, { error: header.error });
-    const appended = otaCore.verifyAppendedHash(buf);
-    if (!appended.ok) return sendJSON(res, 400, { error: appended.error });
-    const meta = otaCore.parseImageMeta(buf);
-    if (!meta || !meta.version || !meta.project) {
-      return sendJSON(res, 400, { error: 'image has no readable app descriptor (version/project) — is it an EnergyAnalyzer build?' });
-    }
-    if (meta.project !== OTA_PROJECT) {
-      return sendJSON(res, 400, { error: `project is "${meta.project}", expected "${OTA_PROJECT}"` });
-    }
-    if (!OTA_SEMVER.test(meta.version)) {
-      return sendJSON(res, 400, { error: `version "${meta.version}" is not strict semver x.y.z` });
-    }
+    const validated = otaCore.validateApplicationImage(buf);
+    if (!validated.ok) return sendJSON(res, 400, { error: validated.error });
+    const meta = validated.meta;
     const staged = otaCore.stageRelease(OTA_DIR, meta.version, buf);
     if (!staged.ok) return sendJSON(res, 409, { error: staged.error });
     state.otaStaged = {
@@ -298,6 +327,7 @@ function otaStatusObject() {
     active_published_at: info.enabled && info.manifest.published_at ? info.manifest.published_at : null,
     reported_version: state.otaReported.version,
     reported_at: state.otaReported.at,
+    reported_source: state.otaReported.source,
     staged: state.otaStaged ? { ...state.otaStaged } : null,
     downloads: { ...state.otaDownloads },
     dir: OTA_DIR,
@@ -332,7 +362,7 @@ const state = {
   prevDeviceP: { l1: 0, l2: 0, l3: 0 },
   lastDevicePush: 0,
   sequence: 0,
-  otaReported: { version: null, at: null },   // from UA EnergyAnalyzer-OTA/<v>
+  otaReported: { version: null, at: null, source: null }, // last running-version report
   otaStaged: null,                            // uploaded, validated, not yet active
   otaDownloads: { count: 0, last_at: null },  // ESP32 firmware.bin fetches
   otaUploadBusy: false,
@@ -384,6 +414,18 @@ function openDatabase() {
       ${SAMPLE_COLS.map(c => `${c} ${c === 't' || c === 'seq' ? 'INTEGER' : 'REAL'}`).join(',\n      ')}
     );`);
     db.exec('CREATE INDEX IF NOT EXISTS idx_samples_t ON samples(t);');
+    db.exec(`CREATE TABLE IF NOT EXISTS device_firmware (
+      device_id TEXT PRIMARY KEY,
+      version TEXT NOT NULL,
+      reported_at INTEGER NOT NULL,
+      source TEXT NOT NULL
+    );`);
+    const report = db.prepare('SELECT version, reported_at, source FROM device_firmware WHERE device_id = ?')
+      .get(ESP32_DEVICE_ID);
+    if (report && validFirmwareVersion(report.version) && Number.isFinite(report.reported_at)) {
+      state.otaReported = { version: report.version, at: report.reported_at, source: report.source };
+    }
+    serialLogs.initDatabase(db);
     insertStmt = db.prepare(INSERT_SQL);
     console.log(`  db:      ${DB_PATH}`);
     return true;
@@ -777,16 +819,18 @@ async function pollEsp32() {
     const data = await res.json();
     const meter = data && typeof data === 'object' ? data.meter : null;
     if (!meter || typeof meter !== 'object') throw new Error('ESP32 payload has no meter object');
+    // Trust only the response to our configured device poll, not arbitrary
+    // inbound requests. Capture envelope metadata before projecting the meter.
+    recordDeviceVersion(data.firmware_version, 'lan.json');
     // Once the ESP32 pushes, push stays the reported feed (LAN pull keeps
     // working silently as a second transport, but must not flicker status).
     ingestMeterPayload(meter, Date.now(), state.device.feed === 'push' ? 'push' : 'pull');
   } catch (err) {
-    // In push mode the ESP32 connects to us; poll failures are expected and
-    // must not flip the device status to offline.
+    // Keep the last successful contact and meter state during a missed poll.
+    // deviceStatus expires contact by age; a single failure is not an outage.
+    // In push mode LAN pull failures are expected and are not its diagnostics.
     if (state.device.feed !== 'push') {
-      state.device.connected = false;
       state.device.last_error = String(err && err.message ? err.message : err);
-      if (state.source === 'device') state.device.stale = true;
     }
   } finally {
     deviceBusy = false;
@@ -795,25 +839,112 @@ async function pollEsp32() {
 
 // ---------------------------------------------------------------- history
 
-function downsample(samples, maxPoints) {
-  if (samples.length <= maxPoints) return samples;
-  const size = Math.ceil(samples.length / maxPoints);
-  const out = [];
-  for (let i = 0; i < samples.length; i += size) {
-    out.push(aggregate(samples.slice(i, i + size)));
-  }
-  return out;
+const HISTORY_RANGE_MS = {
+  '1m': 60000, '5m': 300000, live: 600000, '15m': 900000,
+  '30m': 1800000, '1h': 3600000, '6h': 21600000, '24h': 86400000,
+  '7d': 604800000, '30d': 2592000000, '90d': 7776000000,
+  '180d': 15552000000, '1y': 31536000000, '2y': 63072000000,
+  '5y': 157680000000,
+};
+
+const HISTORY_MAX_POINTS = 720;
+const HISTORY_CACHE_MS = 15000;
+const HISTORY_CACHE_MAX = 32;
+const historyCache = new Map();
+
+function historyBucketMs(span) {
+  const resolution = span <= HISTORY_RANGE_MS['1h'] ? 1000 : 60000;
+  // Epoch-aligned inclusive windows can touch one extra bucket at an edge.
+  return Math.ceil(span / (HISTORY_MAX_POINTS - 1) / resolution) * resolution;
 }
 
-function historyFor(range) {
-  switch (range) {
-    case 'live': return { unit: 's', points: state.sec.slice(-600) };
-    case '1h': return { unit: 's', points: downsample(state.sec.slice(-3600), 600) };
-    case '6h': return { unit: 'min', points: state.min.slice(-360) };
-    case '24h': return { unit: 'min', points: downsample(state.min.slice(-1440), 720) };
-    case '7d': return { unit: 'min', points: downsample(state.min.slice(-10080), 720) };
-    default: return { unit: 's', points: state.sec.slice(-600) };
+function historySqlitePoints(source, from, to, bucketMs) {
+  const counters = SAMPLE_COLS.filter(c => c.endsWith('_e_wh'));
+  const cols = SAMPLE_COLS.filter(c => c !== 't' && !counters.includes(c))
+    .map(c => `${aggExpr(c)} AS ${c}`).join(', ');
+  const args = [source, from, to];
+  const energy = counters.map(c => {
+    args.push(source, from, to);
+    // Counters can reset, so neither AVG nor MAX is a real recorded value.
+    // Index-bounded lookups also preserve a wholly unavailable counter as null.
+    return `(SELECT e.${c} FROM samples e WHERE e.source = ?
+      AND e.t >= MAX(?, buckets.bucket * ${bucketMs})
+      AND e.t <= MIN(?, (buckets.bucket + 1) * ${bucketMs} - 1)
+      AND e.${c} IS NOT NULL ORDER BY e.t DESC, e.id DESC LIMIT 1) AS ${c}`;
+  }).join(', ');
+  return db.prepare(`WITH buckets AS (
+    SELECT CAST(t / ${bucketMs} AS INTEGER) AS bucket, MAX(t) AS t, ${cols}
+    FROM samples WHERE source = ? AND t >= ? AND t <= ? GROUP BY bucket
+  ) SELECT buckets.*, ${energy} FROM buckets ORDER BY t LIMIT ${HISTORY_MAX_POINTS}`)
+    .all(...args).map(rowToSample);
+}
+
+function historySqliteRange(source, range, from, to, bucketMs) {
+  const first = Math.floor(from / bucketMs), last = Math.floor(to / bucketMs);
+  const middleFrom = (first + 1) * bucketMs, middleTo = last * bucketMs - 1;
+  const key = `${source}\0${range}`;
+  for (const [k, value] of historyCache) {
+    if (to < value.at || to - value.at >= HISTORY_CACHE_MS) historyCache.delete(k);
   }
+  let cached = historyCache.get(key);
+  if (!cached || cached.db !== db || cached.from !== middleFrom || cached.to !== middleTo) {
+    cached = {
+      db, at: to, from: middleFrom, to: middleTo,
+      points: middleFrom <= middleTo ? historySqlitePoints(source, middleFrom, middleTo, bucketMs) : [],
+      oldest: db.prepare('SELECT t FROM samples WHERE source = ? ORDER BY t LIMIT 1').get(source)?.t ?? null,
+    };
+  }
+  // Only whole interior buckets are cached. Re-query both clipped edges so a
+  // rolling cutoff never reuses expired samples and the current minute is live.
+  const leading = historySqlitePoints(source, from, Math.min(to, middleFrom - 1), bucketMs);
+  const trailing = first === last ? [] : historySqlitePoints(source, last * bucketMs, to, bucketMs);
+  const points = [...leading, ...cached.points, ...trailing];
+  const oldest = [cached.oldest, ...points.map(p => p.t)].filter(Number.isFinite);
+  cached.oldest = oldest.length ? Math.min(...oldest) : null;
+  historyCache.delete(key);
+  historyCache.set(key, cached);
+  while (historyCache.size > HISTORY_CACHE_MAX) historyCache.delete(historyCache.keys().next().value);
+  return { points, partial: cached.oldest === null || cached.oldest > from };
+}
+
+function historyMemoryPoints(from, to, bucketMs) {
+  // Boot-loaded buffers have no source provenance (and their minute values
+  // may combine sources). On storage failure conservatively use this session
+  // only, rather than presenting those rows as the currently selected source.
+  const inRange = s => Number.isFinite(s.t) && s.t >= Math.max(from, state.startedAt) && s.t <= to;
+  const raw = [...new Set([...state.sec.slice(-SEC_MAX), ...state.minuteTail.slice(-60)])]
+    .filter(inRange).sort((a, b) => a.t - b.t);
+  const firstRaw = raw.length ? raw[0].t : Infinity;
+  const older = state.min.slice(-MIN_MAX).filter(s => inRange(s) && s.t < firstRaw);
+  const buckets = new Map();
+  for (const s of [...older, ...raw].sort((a, b) => a.t - b.t)) {
+    const bucket = Math.floor(s.t / bucketMs);
+    if (!buckets.has(bucket)) buckets.set(bucket, []);
+    buckets.get(bucket).push(s);
+  }
+  return [...buckets.values()].map(aggregate);
+}
+
+function historyFor(range, now = Date.now()) {
+  if (!Object.hasOwn(HISTORY_RANGE_MS, range)) throw new Error('unknown history range');
+  const span = HISTORY_RANGE_MS[range];
+  const from = now - span;
+  const bounds = { unit: span <= HISTORY_RANGE_MS['1h'] ? 's' : 'min',
+    from, to: now, span_ms: span };
+  let warning = 'SQLite history unavailable; showing only available in-memory samples.';
+  if (db) {
+    try {
+      const result = historySqliteRange(state.source, range, from, now, historyBucketMs(span));
+      return { ...bounds, storage: 'sqlite', ...result };
+    } catch {
+      historyCache.delete(`${state.source}\0${range}`);
+      warning = 'SQLite history query failed; showing only available in-memory samples.';
+    }
+  }
+  return {
+    ...bounds, storage: 'memory', partial: true, warning,
+    points: historyMemoryPoints(from, now, historyBucketMs(span)),
+  };
 }
 
 // ---------------------------------------------------------------- HTTP
@@ -861,7 +992,7 @@ function serveStatic(req, res, pathname) {
 function deviceStatus(now = Date.now()) {
   const d = state.device;
   const age = d.last_seen === null ? null : Math.max(0, now - d.last_seen);
-  const connected = d.connected && age !== null && age < DEVICE_STALE_MS;
+  const connected = d.connected && age !== null && age <= ESP32_CONNECTION_TIMEOUT_MS;
   const reportedAge = d.age_ms === null ? null : Math.max(0, d.age_ms) + (age || 0);
   const sequenceAge = d.last_sequence_at === null ? null : Math.max(0, now - d.last_sequence_at);
   const sampleAge = reportedAge === null && sequenceAge === null ? null
@@ -869,7 +1000,7 @@ function deviceStatus(now = Date.now()) {
   let health = !connected
     ? { code: age === null ? 'waiting' : 'esp32_offline', severity: 'error',
       message: age === null ? 'Waiting for ESP32 data.'
-        : 'Communication lost with ESP32. Check its power, Wi-Fi and network connection.' }
+        : 'Communication lost with ESP32: no data received for more than 8 seconds. Check its power, Wi-Fi and network connection.' }
     : { code: 'ok', severity: 'ok', message: 'ESP32 connected; meter readings are live.' };
   if (connected && d.adapter_connected === false) {
     health = { code: 'adapter_disconnected', severity: 'error',
@@ -884,8 +1015,8 @@ function deviceStatus(now = Date.now()) {
     health = { code: 'meter_stale', severity: 'warning',
       message: 'ESP32 is online, but meter readings are not updating. Check RS-485 wiring, adapter and meter power.' };
   }
-  return { ...d, connected, stale: health.code !== 'ok',
-    last_seen_age_ms: age, sample_age_ms: sampleAge, timeout_ms: DEVICE_STALE_MS, health };
+  return { ...d, firmware: firmwareStatus(now), connected, stale: health.code !== 'ok',
+    last_seen_age_ms: age, sample_age_ms: sampleAge, timeout_ms: ESP32_CONNECTION_TIMEOUT_MS, health };
 }
 
 function readingsPayload() {
@@ -944,13 +1075,15 @@ async function handleSource(res, body) {
 }
 
 async function handleIngest(req, res, body) {
-  if (INGEST_TOKEN) {
-    const provided = req.headers['x-ingest-token'] || req.headers['x-api-key'];
-    if (provided !== INGEST_TOKEN) return sendJSON(res, 401, { error: 'invalid ingest token' });
-  }
-  // The ESP32's data pushes carry its running firmware version in the UA.
-  recordDeviceVersion(req.headers['user-agent']);
+  if (INGEST_TOKEN && !ingestTokenMatches(req)) return sendJSON(res, 401, { error: 'invalid ingest token' });
   if (!body || typeof body !== 'object') return sendJSON(res, 400, { error: 'invalid payload' });
+  // Legacy readings may still be accepted without a configured token, but
+  // unauthenticated requests must never mutate trusted firmware metadata.
+  if (INGEST_TOKEN) {
+    const inJSON = Object.hasOwn(body, 'firmware_version');
+    recordDeviceVersion(inJSON ? body.firmware_version : req.headers['x-firmware-version'],
+      inJSON ? 'ingest.json' : 'ingest.header');
+  }
   // Native ESP32 payload — the exact JSON the ESP32 serves on /api/readings
   // ({meter:{groups,registers,...}, ...}). This is the shape the ESP32 pushes
   // over the tailnet.
@@ -1073,9 +1206,9 @@ const server = http.createServer(async (req, res) => {
       return sendJSON(res, 200, readingsPayload());
     }
     if (req.method === 'GET' && p === '/api/history') {
-      const range = url.searchParams.get('range') || 'live';
+      const range = url.searchParams.get('range') ?? 'live';
       const h = historyFor(range);
-      return sendJSON(res, 200, { range, unit: h.unit, generated_at: Date.now(), points: h.points });
+      return sendJSON(res, 200, { range, generated_at: h.to, ...h });
     }
     if (req.method === 'GET' && p === '/api/export') {
       return handleExport(res, url);
@@ -1088,6 +1221,23 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'POST' && p === '/api/ingest') {
       return handleIngest(req, res, await readBody(req, MAX_BODY));
+    }
+    if (req.method === 'POST' && p === '/api/serial-log') {
+      return await serialLogs.post(req, res, { db, tokenMatches: otaTokenMatches,
+        sourceAllowed: otaSourceAllowed, validFirmwareVersion, readRawBody });
+    }
+    if (req.method === 'GET' && p === '/api/serial-log') {
+      return serialLogs.get(req, res, url, { db, sourceAllowed: otaSourceAllowed, defaultDevice: ESP32_DEVICE_ID });
+    }
+    // Legacy metadata-only compatibility route. Actual console batches must
+    // use /api/serial-log; neither route is a meter sample.
+    if (req.method === 'POST' && p === '/api/serial') {
+      const authorized = ingestTokenMatches(req) || (otaTokenMatches(req.headers['x-ota-token'])
+        && otaSourceAllowed(req.socket && req.socket.remoteAddress));
+      if (!authorized) return sendJSON(res, 401, { error: 'unauthorized' });
+      await readRawBody(req, 256 * 1024);
+      recordDeviceVersion(req.headers['x-firmware-version'], 'serial.header');
+      return sendJSON(res, 200, { ok: true, log_storage: false });
     }
     // OTA endpoints: private, pull-based firmware feed for the ESP32.
     if (req.method === 'GET' && p === '/api/firmware/manifest') {

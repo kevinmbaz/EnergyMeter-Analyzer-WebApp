@@ -29,7 +29,7 @@
     </nav>
     <div class="side-status">
       <div class="side-status-row"><span class="dot" id="sideDot"></span><span id="sideSource">Starting…</span></div>
-      <div class="side-status-meta" id="sideFirmware" hidden>firmware —</div>
+      <div class="side-status-meta" id="sideFirmware" title="Running firmware reported by the ESP32, not the staged OTA release">ESP32 firmware: Not reported</div>
       <div class="side-status-meta" id="sideMeta">—</div>
     </div>
   </aside>
@@ -44,11 +44,29 @@
         <label class="range-wrap" id="rangeWrap">
           <span class="sr-only">Time range</span>
           <select id="rangeSelect" aria-label="Chart time range">
-            <option value="live">Live · 10 min</option>
-            <option value="1h">1 hour</option>
-            <option value="6h">6 hours</option>
-            <option value="24h">24 hours</option>
-            <option value="7d">7 days</option>
+            <optgroup label="Minutes">
+              <option value="1m">1 minute</option>
+              <option value="5m">5 minutes</option>
+              <option value="live" selected>Live · 10 min</option>
+              <option value="15m">15 minutes</option>
+              <option value="30m">30 minutes</option>
+            </optgroup>
+            <optgroup label="Hours &amp; days">
+              <option value="1h">1 hour</option>
+              <option value="6h">6 hours</option>
+              <option value="24h">24 hours</option>
+              <option value="7d">7 days</option>
+            </optgroup>
+            <optgroup label="Months">
+              <option value="30d">1 month · 30 days</option>
+              <option value="90d">3 months · 90 days</option>
+              <option value="180d">6 months · 180 days</option>
+            </optgroup>
+            <optgroup label="Years">
+              <option value="1y">1 year · 365 days</option>
+              <option value="2y">2 years</option>
+              <option value="5y">5 years</option>
+            </optgroup>
           </select>
         </label>
         <div class="chips" id="phaseChips" aria-label="Phase visibility">
@@ -64,6 +82,11 @@
     </header>
 
     <div class="notice" id="notice" role="status" aria-live="polite" hidden><span class="notice-icon" aria-hidden="true">!</span><p id="noticeText"></p></div>
+
+    <div class="history-status" id="historyStatus" role="status" aria-live="polite">
+      <span id="historySummary">Loading chart history…</span>
+      <span class="history-hint">Hover or touch a chart to inspect time and values. Ranges are rolling periods.</span>
+    </div>
 
     <main id="views">
 
@@ -212,6 +235,32 @@
       <!-- ============ SETTINGS ============ -->
       <section class="view" data-view="settings">
         <div class="settings-grid">
+          <article class="panel serial-panel" aria-labelledby="serialTitle">
+            <div class="panel-head">
+              <div><h3 id="serialTitle">ESP32 serial console</h3><p class="serial-subtitle">Console output forwarded over Tailscale · read-only</p></div>
+              <span class="pill" id="serialPill">Waiting for logs</span>
+            </div>
+            <div class="serial-toolbar">
+              <form id="serialDeviceForm" class="serial-device-form">
+                <label for="serialDevice">Device name</label>
+                <input id="serialDevice" type="text" maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9._\-]{0,63}" placeholder="Configured ESP32 (default)" autocomplete="off" spellcheck="false">
+                <button class="btn" id="serialLoad" type="submit">Load device</button>
+              </form>
+              <div class="serial-actions">
+                <button class="btn" id="serialPause" type="button" aria-pressed="false">Pause logs</button>
+                <button class="btn" id="serialRefresh" type="button">Refresh</button>
+                <button class="btn" id="serialClear" type="button" title="Clear this display only; stored logs are not deleted">Clear display</button>
+                <label class="serial-follow"><input id="serialAutoscroll" type="checkbox" checked> Auto-scroll</label>
+              </div>
+            </div>
+            <p id="serialMessage" class="serial-message" role="status" aria-live="polite" hidden></p>
+            <div class="serial-terminal">
+              <pre id="serialOutput" tabindex="0" role="log" aria-live="off" aria-label="ESP32 console output" aria-describedby="serialSummary"></pre>
+              <p id="serialEmpty" class="serial-empty">Waiting for console logs from the ESP32.</p>
+            </div>
+            <p id="serialMeta" class="serial-meta">No log batch received yet.</p>
+            <p id="serialSummary" class="setting-note">Updates automatically while Settings is open. Clear display does not delete saved logs.</p>
+          </article>
           <article class="panel">
             <div class="panel-head"><h3>Data source</h3><span class="pill" id="sourcePill">—</span></div>
             <label class="slider-row">
