@@ -109,10 +109,11 @@ b) A push task (every 2 s, when tailscale is connected):
             int n = snprintf(head, sizeof(head),
                 "POST /api/ingest HTTP/1.0\r\n"
                 "Host: jetson-energy\r\n"
+                "User-Agent: EnergyAnalyzer-OTA/%s\r\n"   // running firmware version
                 "Content-Type: application/json\r\n"
                 "Content-Length: %u\r\n"
                 "Connection: close\r\n"
-                "\r\n", (unsigned)body_len);
+                "\r\n", FIRMWARE_VERSION, (unsigned)body_len);
             microlink_tcp_send(sock, head, n);
             microlink_tcp_send(sock, body, body_len);
             microlink_tcp_close(sock);

@@ -240,3 +240,21 @@ test('ingest and dashboard stay available when OTA web flow is used', async () =
   const s = await h.getJSON('/api/status');
   assert.equal(s.body.ota.token_configured, true);
 });
+
+test('device firmware version is captured from ingest pushes and plain EnergyAnalyzer UAs', async () => {
+  const h = serverHarness({ OTA_DIR: tmpdir() });
+  await h.request('POST', '/api/ingest', {
+    headers: { 'Content-Type': 'application/json', 'User-Agent': 'EnergyAnalyzer-OTA/2.0.0 (esp32s3)' },
+    body: '{}',
+  });
+  let s = await h.getJSON('/api/status');
+  assert.equal(s.body.ota.reported_version, '2.0.0');
+  assert.ok(s.body.ota.reported_at > 0);
+  // plain EnergyAnalyzer/<version> (no -OTA suffix) is accepted too
+  await h.request('POST', '/api/ingest', {
+    headers: { 'Content-Type': 'application/json', 'User-Agent': 'EnergyAnalyzer/2.1.0 (esp32s3)' },
+    body: '{}',
+  });
+  s = await h.getJSON('/api/status');
+  assert.equal(s.body.ota.reported_version, '2.1.0');
+});

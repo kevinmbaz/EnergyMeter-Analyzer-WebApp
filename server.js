@@ -56,6 +56,17 @@ const OTA_SEMVER = /^\d+\.\d+\.\d+$/;
 const OTA_UPLOAD_LIMIT = OTA_SIZE_CAP + 65536; // upload body cap with slack
 const OTA_PROJECT = 'EnergyAnalyzer';          // project name baked into app_desc
 const OTA_LAYOUT = 'energymeter-ota-v1';       // manifest layout for this feed
+
+// The ESP32 reports the firmware it is running through its User-Agent on any
+// request it makes (OTA polls and data pushes): EnergyAnalyzer-OTA/<version>.
+function otaVersionFromUA(ua) {
+  const m = /EnergyAnalyzer(?:-OTA)?\/([\d.]+)/.exec(String(ua || ''));
+  return m ? m[1] : null;
+}
+function recordDeviceVersion(ua) {
+  const v = otaVersionFromUA(ua);
+  if (v && v !== state.otaReported.version) state.otaReported = { version: v, at: Date.now() };
+}
 // Absolute path: the vm test harness swaps `require`, so relative requires
 // must never be used for project files.
 const otaCore = require(path.join(__dirname, 'scripts', 'ota_core.js'));
@@ -131,9 +142,7 @@ function otaActiveInfo() {
 function handleOtaManifest(req, res) {
   if (!otaTokenMatches(req.headers['x-ota-token'])) return sendJSON(res, 401, { error: 'unauthorized' });
   if (!otaSourceAllowed(req.socket && req.socket.remoteAddress)) return sendJSON(res, 403, { error: 'forbidden' });
-  const ua = req.headers['user-agent'] || '';
-  const m = /EnergyAnalyzer-OTA\/([\d.]+)/.exec(ua);
-  if (m) state.otaReported = { version: m[1], at: Date.now() };
+  recordDeviceVersion(req.headers['user-agent']);
   const info = otaActiveInfo();
   if (!info.enabled) {
     const body = JSON.stringify({ enabled: false });
@@ -174,9 +183,9 @@ function handleOtaBinary(req, res, pathname) {
   // Track ESP32 download activity for the update-status panel.
   state.otaDownloads.count += 1;
   state.otaDownloads.last_at = Date.now();
-  const ua = req.headers['user-agent'] || '';
-  const uaVer = /EnergyAnalyzer-OTA\/([\d.]+)/.exec(ua);
-  if (uaVer) state.otaDownloads.last_ua_version = uaVer[1];
+  const uaVer = otaVersionFromUA(req.headers['user-agent']);
+  if (uaVer) state.otaDownloads.last_ua_version = uaVer;
+  recordDeviceVersion(req.headers['user-agent']);
   const buf = fs.readFileSync(info.binPath);
   // Exact Content-Length, no chunked transfer, no compression, no redirects.
   res.writeHead(200, {
@@ -939,6 +948,8 @@ async function handleIngest(req, res, body) {
     const provided = req.headers['x-ingest-token'] || req.headers['x-api-key'];
     if (provided !== INGEST_TOKEN) return sendJSON(res, 401, { error: 'invalid ingest token' });
   }
+  // The ESP32's data pushes carry its running firmware version in the UA.
+  recordDeviceVersion(req.headers['user-agent']);
   if (!body || typeof body !== 'object') return sendJSON(res, 400, { error: 'invalid payload' });
   // Native ESP32 payload — the exact JSON the ESP32 serves on /api/readings
   // ({meter:{groups,registers,...}, ...}). This is the shape the ESP32 pushes

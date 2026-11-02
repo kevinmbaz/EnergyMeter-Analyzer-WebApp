@@ -961,8 +961,13 @@
       if (meta.ota) updateOtaPanel(meta.ota);
     }
     const agoS = ms => (ms == null ? '—' : `${Math.max(0, Math.round((Date.now() - ms) / 1000))} s ago`);
+    const fw = meta && meta.ota ? meta.ota.reported_version : null;
+    const fwEl = $('sideFirmware');
+    if (fw) { fwEl.textContent = `firmware v${fw}`; fwEl.hidden = false; }
+    else fwEl.hidden = true;
     const rows = [
       ['Source', source === 'device' ? 'ESP32 device' : 'Built-in simulator'],
+      ['Device firmware', fw ? `v${fw} · ${agoS(meta.ota.reported_at)}` : 'not reported yet'],
       ['Source mode', mode === 'auto' ? 'Auto' : mode === 'device' ? 'ESP32 only' : 'Simulator only'],
       ['Data flow', dev && dev.feed === 'push' ? 'ESP32 → server (push)' : 'server → ESP32 (pull)'],
       ['Latest sample', S.latest ? `#${S.latest.seq} · ${fmtClock(S.latest.t)}` : '—'],
