@@ -38,7 +38,7 @@ const ESP32_URL = process.env.ESP32_URL ?? 'http://energymeter.local/api/reading
 const ESP32_POLL_MS = Math.max(1000, Number(process.env.ESP32_POLL_MS || 2000));
 const ESP32_TIMEOUT_MS = Number(process.env.ESP32_TIMEOUT_MS || 4000);
 // Connection grace period is independent of meter sample freshness.
-const ESP32_CONNECTION_TIMEOUT_MS = 8000;
+const ESP32_CONNECTION_TIMEOUT_MS = 60000;
 const DEVICE_STALE_MS = 15000;
 // Optional shared secret for POST /api/ingest (header: X-Ingest-Token).
 // Off by default; set when ingesting over a public network.
@@ -1000,7 +1000,7 @@ function deviceStatus(now = Date.now()) {
   let health = !connected
     ? { code: age === null ? 'waiting' : 'esp32_offline', severity: 'error',
       message: age === null ? 'Waiting for ESP32 data.'
-        : 'Communication lost with ESP32: no data received for more than 8 seconds. Check its power, Wi-Fi and network connection.' }
+        : 'Communication lost with ESP32: no data received for more than 1 minute. Check its power, Wi-Fi and network connection.' }
     : { code: 'ok', severity: 'ok', message: 'ESP32 connected; meter readings are live.' };
   if (connected && d.adapter_connected === false) {
     health = { code: 'adapter_disconnected', severity: 'error',

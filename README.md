@@ -111,8 +111,8 @@ History: 1 s resolution kept for 2 h, 1 min aggregates kept for 7 days
 
 The dashboard shows a persistent warning and sidebar status for:
 
-- **ESP32 offline:** no valid readings/status payload received for more than 8
-  seconds, for both push and pull feeds. A single failed or delayed pull does not
+- **ESP32 offline:** no valid readings/status payload received for more than 1
+  minute, for both push and pull feeds. A single failed or delayed pull does not
   immediately disconnect the ESP32 or discard its last readings; each successful
   payload resets the timeout. Check ESP32 power, Wi-Fi and the network path.
 - **RS-485 disconnected:** the ESP32 explicitly reports `adapter_connected: false`.

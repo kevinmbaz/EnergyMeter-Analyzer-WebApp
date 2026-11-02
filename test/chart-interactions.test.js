@@ -10,10 +10,10 @@ function clientHarness(fetcher = async () => ({ ok: true, json: async () => ({ p
   const elements = new Map(), drawn = [];
   const ctx = Object.fromEntries(['save', 'restore', 'beginPath', 'rect', 'clip', 'moveTo', 'lineTo', 'stroke', 'setLineDash']
     .map(name => [name, (...args) => drawn.push([name, ...args])]));
-  const element = id => ({ id, textContent: '', hidden: false, value: 'live',
+  const element = id => ({ id, textContent: '', innerHTML: '', children: [], hidden: false, value: 'live',
     style: { setProperty() {} }, dataset: {}, classList: { toggle() {} },
     selectedOptions: [{ textContent: 'Selected range' }],
-    addEventListener(type, fn) { this[type] = fn; }, setAttribute() {}, append() {},
+    addEventListener(type, fn) { this[type] = fn; }, setAttribute() {}, append(...nodes) { this.children.push(...nodes); },
   });
   const get = id => {
     if (!elements.has(id)) elements.set(id, element(id));
@@ -36,9 +36,44 @@ function clientHarness(fetcher = async () => ({ ok: true, json: async () => ({ p
   });
   const source = fs.readFileSync(path.join(__dirname, '..', 'public/app.js'), 'utf8');
   vm.runInContext(source.replace('  boot();',
-    '  globalThis.client = { S, baseChartOptions, createChartFor, charts, fetchHistory, fmtAxisTime, energyBuckets, bindControls, updateCharts };'), context);
+    '  globalThis.client = { S, baseChartOptions, createChartFor, charts, fetchHistory, fmtAxisTime, energyBuckets, bindControls, updateCharts, TABLE_GROUPS, chartDefs, CHART_VIEWS, VIEW_META, updatePowerStats, updateVoltageStats, updateCurrentStats };'), context);
   return { ...context.client, get, drawn, context };
 }
+
+test('dashboard omits only the five unneeded minimum-voltage and demand readings', () => {
+  const h = clientHarness();
+  assert.deepEqual(Array.from(h.TABLE_GROUPS, ([key]) => key), [
+    'voltage_ln', 'voltage_ln_max', 'voltage_ln_avg',
+    'voltage_ll', 'voltage_ll_max', 'voltage_ll_avg',
+    'current', 'active_power', 'reactive_power', 'apparent_power',
+    'apparent_power_demand', 'power_factor', 'cos_phi', 'frequency',
+  ]);
+  assert.deepEqual(Array.from(h.CHART_VIEWS.power), ['powerPChart', 'powerQChart', 'powerSChart']);
+  assert.deepEqual(Array.from(h.CHART_VIEWS.current), ['currentChart']);
+  const removed = ['vln_min', 'vll_min', 'i_d', 'p_d', 'q_d'];
+  assert.ok(Object.values(h.chartDefs).flat().every(series => !removed.includes(series.key)));
+  const html = fs.readFileSync(path.join(__dirname, '..', 'public/index.html'), 'utf8');
+  assert.doesNotMatch(html, /id="(?:powerDChart|currentDChart)"/);
+  assert.doesNotMatch(h.VIEW_META.current[1], /demand/i);
+
+  const phase = { vln: 230, vln_max: 240, vln_avg: 235, vll: 400,
+    i: 2, p: 100, q: 50, s: 150, s_d: 175, pf: 0.9 };
+  for (const key of removed) Object.defineProperty(phase, key, {
+    get() { throw new Error('summary must not read hidden metric ' + key); },
+  });
+  const sample = { l1: phase, l2: phase, l3: phase, tot: { p: 300, q: 150, s: 450 } };
+  h.updatePowerStats(sample);
+  h.updateVoltageStats(sample);
+  h.updateCurrentStats(sample);
+  const cards = id => h.get(id).children.map(card => card.innerHTML);
+  assert.equal(cards('powerStats').length, 3);
+  assert.ok(cards('powerStats').slice(0, 2).every(card => !/demand/i.test(card)));
+  assert.match(cards('powerStats')[2], /demand/i, 'apparent power demand stays available');
+  assert.equal(cards('voltageStats').length, 3);
+  assert.ok(cards('voltageStats').every(card => /max/.test(card) && /avg/.test(card)));
+  assert.equal(cards('currentStats').length, 3);
+  assert.ok(cards('currentStats').every(card => !/demand/i.test(card)));
+});
 
 test('chart tooltip formats Intl number formatters instead of calling them as functions', () => {
   const h = clientHarness();
@@ -51,7 +86,7 @@ test('chart tooltip formats Intl number formatters instead of calling them as fu
 
 test('time-series and energy charts draw a bounded hover/touch crosshair that clears on exit', () => {
   const h = clientHarness();
-  for (const id of ['overviewPowerChart', 'powerPChart', 'voltageLnChart', 'currentDChart', 'freqChart', 'energyBarChart']) {
+  for (const id of ['overviewPowerChart', 'powerPChart', 'voltageLnChart', 'currentChart', 'freqChart', 'energyBarChart']) {
     const chart = h.createChartFor(id);
     const plugin = chart.config.plugins?.find(p => p.id === 'chart-cursor');
     assert.ok(plugin, id + ' has a cursor plugin');
@@ -140,9 +175,9 @@ test('yearly energy charts use calendar-month buckets and ignore missing/reset c
   assert.equal(h.get('energyChartTitle').textContent, 'Energy per month');
 });
 
-test('cursor readouts use chart-specific units including current demand and frequency', () => {
+test('cursor readouts use chart-specific units including current and frequency', () => {
   const h = clientHarness();
-  for (const [id, unit] of [['currentDChart', 'A'], ['voltageLnChart', 'V'], ['powerQChart', 'var'], ['powerSChart', 'VA'], ['freqChart', 'Hz']]) {
+  for (const [id, unit] of [['currentChart', 'A'], ['voltageLnChart', 'V'], ['powerQChart', 'var'], ['powerSChart', 'VA'], ['freqChart', 'Hz']]) {
     const chart = h.createChartFor(id);
     assert.equal(chart.options.scales.y.title.text, unit, id);
     assert.equal(chart.data.datasets[0].unitLabel, unit, id);

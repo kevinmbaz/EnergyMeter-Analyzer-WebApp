@@ -466,8 +466,8 @@
     const totD = s.tot;
     const demand = k => PHASES.reduce((a, ph) => a + s[ph][k], 0);
     el.append(
-      statCard('Active power', 'kW', fmtKw(totD.p), `demand ${fmtKw(demand('p_d'))} kW · L1 ${fmtKw(s.l1.p)} / L2 ${fmtKw(s.l2.p)} / L3 ${fmtKw(s.l3.p)} kW`),
-      statCard('Reactive power', 'kvar', fmtKvar(totD.q), `demand ${fmtKvar(demand('q_d'))} kvar · L1 ${fmtKvar(s.l1.q)} / L2 ${fmtKvar(s.l2.q)} / L3 ${fmtKvar(s.l3.q)} kvar`),
+      statCard('Active power', 'kW', fmtKw(totD.p), `L1 ${fmtKw(s.l1.p)} / L2 ${fmtKw(s.l2.p)} / L3 ${fmtKw(s.l3.p)} kW`),
+      statCard('Reactive power', 'kvar', fmtKvar(totD.q), `L1 ${fmtKvar(s.l1.q)} / L2 ${fmtKvar(s.l2.q)} / L3 ${fmtKvar(s.l3.q)} kvar`),
       statCard('Apparent power', 'kVA', fmtKva(totD.s), `demand ${fmtKva(demand('s_d'))} kVA · L1 ${fmtKva(s.l1.s)} / L2 ${fmtKva(s.l2.s)} / L3 ${fmtKva(s.l3.s)} kVA`),
     );
   }
@@ -477,10 +477,8 @@
     el.innerHTML = '';
     PHASES.forEach(ph => {
       const d = s[ph];
-      const range = d.vln_max - d.vln_min;
-      const pct = range > 0 ? (d.vln - d.vln_min) / range * 100 : 50;
       el.append(statCard(`${ph.toUpperCase()} · phase to neutral`, 'V', fmt.V.format(d.vln),
-        `60 s range ${fmt.V.format(d.vln_min)}–${fmt.V.format(d.vln_max)} · avg ${fmt.V.format(d.vln_avg)} · L-L ${fmt.V.format(d.vll)}`, pct));
+        `max ${fmt.V.format(d.vln_max)} · avg ${fmt.V.format(d.vln_avg)} · L-L ${fmt.V.format(d.vll)}`));
     });
   }
 
@@ -490,7 +488,7 @@
     PHASES.forEach(ph => {
       const d = s[ph];
       el.append(statCard(`${ph.toUpperCase()} · line current`, 'A', fmt.A.format(d.i),
-        `demand ${fmt.A.format(d.i_d)} A · P ${fmtKw(d.p)} kW · PF ${fmt.pf.format(d.pf)}`));
+        `P ${fmtKw(d.p)} kW · PF ${fmt.pf.format(d.pf)}`));
     });
   }
 
@@ -517,19 +515,14 @@
 
   const TABLE_GROUPS = [
     ['voltage_ln', 'Phase to neutral voltage', 'V', ph => ph.vln],
-    ['voltage_ln_min', 'Minimum phase to neutral voltage', 'V', ph => ph.vln_min],
     ['voltage_ln_max', 'Maximum phase to neutral voltage', 'V', ph => ph.vln_max],
     ['voltage_ln_avg', 'Average phase to neutral voltage', 'V', ph => ph.vln_avg],
     ['voltage_ll', 'Phase to phase voltage', 'V', ph => ph.vll],
-    ['voltage_ll_min', 'Minimum phase to phase voltage', 'V', ph => ph.vll_min],
     ['voltage_ll_max', 'Maximum phase to phase voltage', 'V', ph => ph.vll_max],
     ['voltage_ll_avg', 'Average phase to phase voltage', 'V', ph => ph.vll_avg],
     ['current', 'Current', 'A', ph => ph.i],
-    ['current_demand', 'Current demand', 'A', ph => ph.i_d],
     ['active_power', 'Active power', 'W', ph => ph.p],
-    ['active_power_demand', 'Active power demand', 'W', ph => ph.p_d],
     ['reactive_power', 'Reactive power', 'var', ph => ph.q],
-    ['reactive_power_demand', 'Reactive power demand', 'var', ph => ph.q_d],
     ['apparent_power', 'Apparent power', 'VA', ph => ph.s],
     ['apparent_power_demand', 'Apparent power demand', 'VA', ph => ph.s_d],
     ['power_factor', 'Power factor', '—', ph => ph.pf],
@@ -577,7 +570,7 @@
     if (!loadMeaningful) {
       const empty = document.createElement('p');
       empty.className = 'detail-note';
-      empty.textContent = 'No measurable load — live phase powers are near zero relative to demand (or inputs are not connected yet).';
+      empty.textContent = 'No measurable load — live phase powers are near zero (or inputs are not connected yet).';
       el.append(empty);
       return;
     }
@@ -627,10 +620,6 @@
       { phase: 'l1', key: 's', colorKey: '--p1', label: 'L1 · VA' }, { phase: 'l2', key: 's', colorKey: '--p2', label: 'L2 · VA' },
       { phase: 'l3', key: 's', colorKey: '--p3', label: 'L3 · VA' }, { phase: 'total', key: 's', colorKey: '--muted', label: 'Total', dashed: true },
     ],
-    powerDChart: [
-      { phase: 'l1', key: 'p_d', colorKey: '--p1', label: 'L1' }, { phase: 'l2', key: 'p_d', colorKey: '--p2', label: 'L2' },
-      { phase: 'l3', key: 'p_d', colorKey: '--p3', label: 'L3' }, { phase: 'total', key: 'p', colorKey: '--muted', label: 'Total now', dashed: true },
-    ],
     voltageLnChart: [
       { phase: 'l1', key: 'vln', colorKey: '--p1', label: 'L1 · V' }, { phase: 'l2', key: 'vln', colorKey: '--p2', label: 'L2 · V' },
       { phase: 'l3', key: 'vln', colorKey: '--p3', label: 'L3 · V' },
@@ -643,10 +632,6 @@
       { phase: 'l1', key: 'i', colorKey: '--p1', label: 'L1 · A' }, { phase: 'l2', key: 'i', colorKey: '--p2', label: 'L2 · A' },
       { phase: 'l3', key: 'i', colorKey: '--p3', label: 'L3 · A' }, { phase: 'total', key: 'i', colorKey: '--muted', label: 'Total', dashed: true },
     ],
-    currentDChart: [
-      { phase: 'l1', key: 'i_d', colorKey: '--p1', label: 'L1' }, { phase: 'l2', key: 'i_d', colorKey: '--p2', label: 'L2' },
-      { phase: 'l3', key: 'i_d', colorKey: '--p3', label: 'L3' },
-    ],
     pfChart: [
       { phase: 'l1', key: 'pf', colorKey: '--p1', label: 'L1' }, { phase: 'l2', key: 'pf', colorKey: '--p2', label: 'L2' },
       { phase: 'l3', key: 'pf', colorKey: '--p3', label: 'L3' }, { phase: 'total', key: 'pf', colorKey: '--muted', label: 'Avg', dashed: true },
@@ -656,9 +641,9 @@
   const charts = new Map();
   const CHART_VIEWS = {
     overview: ['overviewPowerChart'],
-    power: ['powerPChart', 'powerQChart', 'powerSChart', 'powerDChart'],
+    power: ['powerPChart', 'powerQChart', 'powerSChart'],
     voltage: ['voltageLnChart', 'voltageLlChart'],
-    current: ['currentChart', 'currentDChart'],
+    current: ['currentChart'],
     quality: ['pfChart', 'freqChart'],
     energy: ['energyBarChart'],
   };
@@ -1262,10 +1247,10 @@
     overview: ['Overview', 'Three-phase measurements · TPM-04-100D'],
     power: ['Power', 'Active, reactive and apparent power per phase'],
     voltage: ['Voltage', 'Phase to neutral and phase to phase'],
-    current: ['Current', 'Line currents and rolling demand'],
+    current: ['Current', 'Line currents per phase'],
     quality: ['Power quality', 'Power factor, frequency and phase balance'],
     energy: ['Energy', 'Accumulated energy and bucket breakdown'],
-    table: ['Live data', 'All measurement groups · updated every poll'],
+    table: ['Live data', 'Measurement groups · updated every poll'],
     settings: ['Settings', 'ESP32 console, firmware, data source and appearance'],
   };
 

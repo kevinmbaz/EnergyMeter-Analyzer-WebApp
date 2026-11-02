@@ -136,10 +136,6 @@
             <div class="chart-box chart-md"><canvas id="powerSChart"></canvas></div>
           </article>
         </div>
-        <article class="panel panel-chart">
-          <div class="panel-head"><div><h3>Power demand</h3><p class="panel-sub">rolling demand per phase · W</p></div></div>
-          <div class="chart-box chart-md"><canvas id="powerDChart"></canvas></div>
-        </article>
       </section>
 
       <!-- ============ VOLTAGE ============ -->
@@ -160,16 +156,10 @@
       <!-- ============ CURRENT ============ -->
       <section class="view" data-view="current">
         <div class="stat-grid" id="currentStats"></div>
-        <div class="two-col">
-          <article class="panel panel-chart">
-            <div class="panel-head"><div><h3>Line currents</h3><p class="panel-sub">A</p></div></div>
-            <div class="chart-box chart-md"><canvas id="currentChart"></canvas></div>
-          </article>
-          <article class="panel panel-chart">
-            <div class="panel-head"><div><h3>Current demand</h3><p class="panel-sub">A · rolling demand</p></div></div>
-            <div class="chart-box chart-md"><canvas id="currentDChart"></canvas></div>
-          </article>
-        </div>
+        <article class="panel panel-chart">
+          <div class="panel-head"><div><h3>Line currents</h3><p class="panel-sub">A</p></div></div>
+          <div class="chart-box chart-lg"><canvas id="currentChart"></canvas></div>
+        </article>
       </section>
 
       <!-- ============ QUALITY ============ -->
@@ -219,7 +209,7 @@
       <section class="view" data-view="table">
         <div class="table-card">
           <div class="panel-head table-head">
-            <div><h3>All measurement groups</h3><p class="panel-sub">live values by phase · updated every poll</p></div>
+            <div><h3>Measurement groups</h3><p class="panel-sub">live values by phase · updated every poll</p></div>
             <span class="panel-hint mono" id="tableStamp">—</span>
           </div>
           <div class="table-scroll">

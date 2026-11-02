@@ -165,10 +165,10 @@ test('legacy OTA reporting accepts only an exact bounded User-Agent after token 
     assert.equal(r.status, status);
     assert.equal((await h.status()).device.firmware.version, '1.3.2');
   }
-  h.advance(20000);
+  h.advance(60001);
   await h.request('GET', '/api/firmware/manifest', undefined, headers);
   s = await h.status();
-  assert.equal(s.device.firmware.reported_at, 120000);
+  assert.equal(s.device.firmware.reported_at, 160001);
   assert.equal(s.device.health.code, 'esp32_offline');
   assert.equal(s.device.firmware.version, '1.3.2');
 });
