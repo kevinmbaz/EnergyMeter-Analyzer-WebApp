@@ -120,22 +120,82 @@ LAN polling; either successful transport counts as contact when both are active.
 
 Run regression tests with `npm test` (no additional dependencies).
 
-## Phase 3 — register-map verification (next step)
+## ESP32 OTA (private, pull-based)
 
-The 19 measurement groups come straight from the ESP32's provisional decoder.
-To finalize:
+The server also hosts the ESP32's firmware feed: `GET /api/firmware/manifest`
+and `GET /firmware/<version>/firmware.bin`. Both require an `X-OTA-Token`
+matching the `OTA_TOKEN` env var (fail closed when unset) and only accept
+tailnet sources (`OTA_ALLOW_CIDRS`, default `100.64.0.0/10` + localhost).
+Manifest responses carry exact Content-Length, the binary is served
+byte-for-byte without compression, chunking or redirects, and releases are
+immutable with old versions retained for rollback.
 
-1. Compare each group against the TPM-04-100D display while a known load is
-   running (check phase order L1/L2/L3 and the power scale — the raw register
-   values' unit is still unconfirmed).
-2. Confirm the Modbus register addresses (start 4000, 114 words) against the
-   manufacturer's register map.
-3. Decode the energy registers so energy comes from the meter instead of
-   server-side integration.
+Publishing is manual and explicit:
 
-When done, flip `candidate_layout` handling in the server/UI to drop the
-provisional banner. Optional later: persistence (SQLite), alerting, and
-having the ESP32 push to `POST /api/ingest` instead of being polled.
+```bash
+node scripts/publish_ota.js firmware.bin manifest.json            # enable feed
+node scripts/publish_ota.js firmware.bin manifest.json --disable  # keep feed off
+```
+
+The CLI validates the ESP32-S3 image (magic, chip id, SHA-256, size
+≤ 0x3f0000) and writes the binary before atomically replacing the manifest.
+The last firmware version each polling device reports (User-Agent
+`EnergyAnalyzer-OTA/<version>`) is exposed via `/api/status` → `ota.*`.
+Full deployment, token and ESP32-side instructions: `docs/ota-guide.md`.
+
+### Web upload & install (Settings → Firmware update)
+
+The dashboard can publish releases without the CLI:
+
+1. **Upload & validate** — `POST /api/ota/upload` (raw `application/octet-stream`
+   body). The server validates the ESP32-S3 image header, the embedded app
+   descriptor (`project` must be `EnergyAnalyzer`, strict-semver `version`),
+   the optional appended SHA-256, and the 0x3f0000 size cap — then STAGES the
+   binary immutably into `releases/<version>/firmware.bin`. The manifest is
+   untouched, so devices see no change yet.
+2. **Install Update** — `POST /api/ota/install {"version": "x.y.z"}` atomically
+   activates the staged release (same tmp+rename manifest swap as the CLI) and
+   requires the version to be strictly newer than the active one.
+3. The panel then tracks the update: staging info, active release, ESP32
+   download activity, and the device-reported version. Completion is confirmed
+   when the device's User-Agent version equals the active release and its
+   status uploads resume.
+
+`OTA_TOKEN` is never used by the dashboard flow — it stays exclusively on the
+server for the ESP32's authenticated pull endpoints. Uploading stages only;
+nothing is activated until Install Update is clicked.
+
+## Data interpretation (TPM-04-100D register map)
+
+The meter's 114-word block (from address 4000) decodes as 57 big-endian
+float32 pairs: live/min/max/avg L-N and L-L voltage, live + demand current,
+live + demand active/reactive/apparent power, power factor, cosφ and
+per-phase frequency. Verified against live captures:
+
+- Power registers are in kW and are scaled to W on ingest (demand block
+  anchor: 20 A × 220 V = 4.4 kW — internally consistent).
+- Frequency is per-phase (three values); the Live data table shows all three.
+- The "demand" block holds frozen max-hold values (20 A / 4.4 kW), not a
+  moving average.
+- Negative power factor on a phase means reverse power flow (CT polarity or
+  real export); the dashboard shows a notice and total PF keeps its sign.
+- Import energy is integrated server-side from live power and never goes
+  negative; exporting phases freeze their accumulation. The meter's true
+  energy registers (classic map 4210+, 64-bit Wh) sit outside the 114-word
+  window the firmware reads — extending the firmware is the remaining step
+  for real meter energy.
+
+## Phase 3 — remaining verification
+
+1. Compare live values against the TPM-04-100D display under known load
+   (live power vs V×I×pf still disagrees ~1.3–1.6×; the kW scale is anchored
+   by the demand block but live units deserve a spot check).
+2. Extend the ESP32 firmware to read the energy registers beyond word 113.
+3. Determine whether L2/L3 negative power factor is reversed CTs or real
+   export (solar), then fix polarity or keep the export-aware display.
+
+Persistence (SQLite) already exists; the samples table covers the full sample
+shape and survives restarts. Optional later: alerting.
 
 ## Layout
 

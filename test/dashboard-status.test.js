@@ -20,13 +20,16 @@ function clientHarness(data, error = null) {
     document: { getElementById: get, createElement: element,
       querySelectorAll: () => [], documentElement: element() },
     localStorage: { getItem() { return null; } },
-    getComputedStyle: () => ({ getPropertyValue: () => '#333333' }),
+    getComputedStyle: () => ({ getPropertyValue: name =>
+      ({ '--p1': '#111111', '--p2': '#222222', '--p3': '#333333',
+         '--accent': '#999999', '--muted': '#777777', '--faint': '#666666',
+         '--line': '#555555', '--ink': '#444444', '--panel': '#333333' }[name] || '#333333') }),
     clearTimeout() {}, AbortSignal,
     fetch: async () => { if (error) throw error; return { ok: true, json: async () => data }; },
   });
   const source = fs.readFileSync(path.join(__dirname, '..', 'public/app.js'), 'utf8');
   vm.runInContext(source.replace('  boot();',
-    '  globalThis.client = { updateSourcePills, pollReadings, S };'), context);
+    '  globalThis.client = { updateSourcePills, pollReadings, S, chartPalette, seriesDs };'), context);
   context.client.S.online = true;
   return { ...context.client, get };
 }
@@ -53,6 +56,32 @@ test('provisional register metadata never shows a banner or adds text to a commu
     assert.ok(!h.get('noticeText').textContent.includes('Provisional register map'));
     if (code !== 'ok') assert.equal(h.get('noticeText').textContent, message + ' No valid meter sample yet.');
   }
+});
+
+test('phase chart series use their own colors, not a shared accent fallback', () => {
+  const h = clientHarness(readings('ok', 'ok', 'ESP32 connected; meter readings are live.'));
+  const palette = h.chartPalette();
+  const ds1 = h.seriesDs('l1', '--p1', 'L1', null);
+  const ds2 = h.seriesDs('l2', '--p2', 'L2', null);
+  const ds3 = h.seriesDs('l3', '--p3', 'L3', null);
+  assert.equal(ds1.borderColor, palette['--p1']);
+  assert.equal(ds2.borderColor, palette['--p2']);
+  assert.equal(ds3.borderColor, palette['--p3']);
+  assert.ok(ds1.borderColor !== ds2.borderColor
+    && ds2.borderColor !== ds3.borderColor && ds1.borderColor !== ds3.borderColor,
+    'L1/L2/L3 series must render in three distinct colors');
+});
+
+test('reverse power flow is called out, not shown as zero', () => {
+  const data = readings('ok', 'ok', 'ESP32 connected; meter readings are live.');
+  data.sample = { t: Date.now(), seq: 1, freq: 50,
+    tot: { p: 100, pf: -0.9, e_wh: 0 },
+    l1: { pf: 0.99, p: 100 }, l2: { pf: -0.99, p: -50 }, l3: { pf: -0.94, p: -30 } };
+  const h = clientHarness(data);
+  h.updateSourcePills(data);
+  assert.ok(h.get('noticeText').textContent.includes('reverse power flow'));
+  assert.ok(h.get('noticeText').textContent.includes('L2/L3'));
+  assert.equal(h.get('notice').hidden, false);
 });
 
 test('dashboard displays specific fault feedback and a non-live badge', () => {

@@ -20,6 +20,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { DatabaseSync } = require('node:sqlite');
+const crypto = require('node:crypto');
 
 
 const PORT = Number(process.env.PORT || 8090);
@@ -40,6 +41,259 @@ const DEVICE_STALE_MS = 15000;
 // Optional shared secret for POST /api/ingest (header: X-Ingest-Token).
 // Off by default; set when ingesting over a public network.
 const INGEST_TOKEN = process.env.INGEST_TOKEN || '';
+
+// ---------------------------------------------------------------- OTA
+// Private pull-based firmware hosting for the ESP32. Fail closed: without
+// OTA_TOKEN every OTA request is rejected. OTA endpoints additionally only
+// accept connections from the configured CIDRs (tailnet by default).
+const OTA_TOKEN = process.env.OTA_TOKEN || '';
+const OTA_DIR = process.env.OTA_DIR || path.join(__dirname, 'firmware');
+const OTA_MANIFEST_FILE = path.join(OTA_DIR, 'manifest.json');
+const OTA_SIZE_CAP = 0x3f0000;   // ESP32-S3 OTA partition budget
+const OTA_ALLOW_CIDRS = (process.env.OTA_ALLOW_CIDRS
+  || '100.64.0.0/10,127.0.0.1/32,::1/128').split(',').map(s => s.trim()).filter(Boolean);
+const OTA_SEMVER = /^\d+\.\d+\.\d+$/;
+const OTA_UPLOAD_LIMIT = OTA_SIZE_CAP + 65536; // upload body cap with slack
+const OTA_PROJECT = 'EnergyAnalyzer';          // project name baked into app_desc
+const OTA_LAYOUT = 'energymeter-ota-v1';       // manifest layout for this feed
+// Absolute path: the vm test harness swaps `require`, so relative requires
+// must never be used for project files.
+const otaCore = require(path.join(__dirname, 'scripts', 'ota_core.js'));
+
+// Never log or echo OTA_TOKEN anywhere. Tokens are compared as SHA-256 digests
+// with a constant-time comparison, so even the comparison time leaks nothing.
+function otaTokenMatches(provided) {
+  if (!OTA_TOKEN) return false;
+  const a = crypto.createHash('sha256').update(String(provided || '')).digest();
+  const b = crypto.createHash('sha256').update(OTA_TOKEN).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
+function ip4ToInt(ip) {
+  const parts = String(ip).split('.');
+  if (parts.length !== 4) return null;
+  let n = 0;
+  for (const p of parts) {
+    const v = Number(p);
+    if (!Number.isInteger(v) || v < 0 || v > 255) return null;
+    n = n * 256 + v;
+  }
+  return n >>> 0;
+}
+
+function otaSourceAllowed(addr) {
+  let ip = String(addr || '');
+  if (ip.startsWith('::ffff:')) ip = ip.slice(7);
+  if (ip === '::1') ip = '127.0.0.1';
+  const n = ip4ToInt(ip);
+  if (n === null) return false;
+  return OTA_ALLOW_CIDRS.some(c => {
+    const [net, bitsStr] = c.split('/');
+    const base = ip4ToInt(net);
+    if (base === null) return false;
+    const bits = Number(bitsStr);
+    if (!Number.isInteger(bits) || bits < 0 || bits > 32) return false;
+    const mask = bits === 0 ? 0 : (~0 << (32 - bits)) >>> 0;
+    return (base & mask) === (n & mask);
+  });
+}
+
+function loadOtaManifest() {
+  try {
+    const m = JSON.parse(fs.readFileSync(OTA_MANIFEST_FILE, 'utf8'));
+    if (!m || typeof m !== 'object' || typeof m.enabled !== 'boolean') return null;
+    if (typeof m.version !== 'string' || !OTA_SEMVER.test(m.version)) return null;
+    if (m.path !== `/firmware/${m.version}/firmware.bin`) return null;
+    return m;
+  } catch { return null; } // missing or malformed manifest = feed disabled
+}
+
+// Active release info with on-disk truth: size and sha256 come from the actual
+// binary (cached by version+size+mtime), never from the manifest alone.
+const otaInfoCache = { version: null, size: -1, mtimeMs: -1, sha256: null };
+function otaActiveInfo() {
+  const m = loadOtaManifest();
+  if (!m || m.enabled !== true) return { enabled: false, manifest: m };
+  const binPath = path.join(OTA_DIR, 'releases', m.version, 'firmware.bin');
+  let st;
+  try { st = fs.statSync(binPath); } catch { return { enabled: false, manifest: m }; }
+  if (!st.isFile() || st.size <= 0 || st.size > OTA_SIZE_CAP) return { enabled: false, manifest: m };
+  if (otaInfoCache.version !== m.version || otaInfoCache.size !== st.size
+      || otaInfoCache.mtimeMs !== st.mtimeMs) {
+    otaInfoCache.version = m.version;
+    otaInfoCache.size = st.size;
+    otaInfoCache.mtimeMs = st.mtimeMs;
+    otaInfoCache.sha256 = crypto.createHash('sha256').update(fs.readFileSync(binPath)).digest('hex');
+  }
+  return { enabled: true, manifest: m, size: st.size, sha256: otaInfoCache.sha256, binPath };
+}
+
+function handleOtaManifest(req, res) {
+  if (!otaTokenMatches(req.headers['x-ota-token'])) return sendJSON(res, 401, { error: 'unauthorized' });
+  if (!otaSourceAllowed(req.socket && req.socket.remoteAddress)) return sendJSON(res, 403, { error: 'forbidden' });
+  const ua = req.headers['user-agent'] || '';
+  const m = /EnergyAnalyzer-OTA\/([\d.]+)/.exec(ua);
+  if (m) state.otaReported = { version: m[1], at: Date.now() };
+  const info = otaActiveInfo();
+  if (!info.enabled) {
+    const body = JSON.stringify({ enabled: false });
+    res.writeHead(200, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Content-Length': Buffer.byteLength(body),
+      'Cache-Control': 'no-store',
+    });
+    return res.end(body);
+  }
+  const body = JSON.stringify({
+    enabled: true,
+    version: info.manifest.version,
+    project: info.manifest.project,
+    chip: info.manifest.chip,
+    layout: info.manifest.layout,
+    size: info.size,
+    sha256: info.sha256,
+    path: info.manifest.path,
+  });
+  res.writeHead(200, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': Buffer.byteLength(body),
+    'Cache-Control': 'no-store',
+  });
+  res.end(body);
+}
+
+function handleOtaBinary(req, res, pathname) {
+  if (!otaTokenMatches(req.headers['x-ota-token'])) return sendJSON(res, 401, { error: 'unauthorized' });
+  if (!otaSourceAllowed(req.socket && req.socket.remoteAddress)) return sendJSON(res, 403, { error: 'forbidden' });
+  const info = otaActiveInfo();
+  // Only the active release's exact URL is served; old releases stay on disk
+  // for rollback via the publish CLI.
+  if (!info.enabled || info.manifest.path !== pathname) {
+    return sendJSON(res, 404, { error: 'firmware not available' });
+  }
+  // Track ESP32 download activity for the update-status panel.
+  state.otaDownloads.count += 1;
+  state.otaDownloads.last_at = Date.now();
+  const ua = req.headers['user-agent'] || '';
+  const uaVer = /EnergyAnalyzer-OTA\/([\d.]+)/.exec(ua);
+  if (uaVer) state.otaDownloads.last_ua_version = uaVer[1];
+  const buf = fs.readFileSync(info.binPath);
+  // Exact Content-Length, no chunked transfer, no compression, no redirects.
+  res.writeHead(200, {
+    'Content-Type': 'application/octet-stream',
+    'Content-Length': buf.length,
+    'Cache-Control': 'no-store, max-age=0',
+    'X-Content-Type-Options': 'nosniff',
+  });
+  res.end(buf);
+}
+
+// ---------------------------------------------------------------- OTA web flow
+// The dashboard uploads a firmware.bin (raw body), the server validates it and
+// STAGES it without touching the manifest; POST /api/ota/install then activates
+// the staged release atomically. OTA_TOKEN is never involved here — it stays
+// exclusively on the server for the ESP32's authenticated pull endpoints.
+
+function readRawBody(req, limit) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', c => {
+      size += c.length;
+      if (size > limit) { reject(Object.assign(new Error('payload too large'), { status: 413 })); req.destroy(); return; }
+      chunks.push(c);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+async function handleOtaUpload(req, res) {
+  if (state.otaUploadBusy) return sendJSON(res, 429, { error: 'another upload is in progress' });
+  state.otaUploadBusy = true;
+  try {
+    const buf = await readRawBody(req, OTA_UPLOAD_LIMIT);
+    if (buf.length > OTA_SIZE_CAP) {
+      return sendJSON(res, 413, { error: `firmware is ${buf.length} bytes — exceeds the 0x${OTA_SIZE_CAP.toString(16)} OTA cap` });
+    }
+    const header = otaCore.validateImageHeader(buf);
+    if (!header.ok) return sendJSON(res, 400, { error: header.error });
+    const appended = otaCore.verifyAppendedHash(buf);
+    if (!appended.ok) return sendJSON(res, 400, { error: appended.error });
+    const meta = otaCore.parseImageMeta(buf);
+    if (!meta || !meta.version || !meta.project) {
+      return sendJSON(res, 400, { error: 'image has no readable app descriptor (version/project) — is it an EnergyAnalyzer build?' });
+    }
+    if (meta.project !== OTA_PROJECT) {
+      return sendJSON(res, 400, { error: `project is "${meta.project}", expected "${OTA_PROJECT}"` });
+    }
+    if (!OTA_SEMVER.test(meta.version)) {
+      return sendJSON(res, 400, { error: `version "${meta.version}" is not strict semver x.y.z` });
+    }
+    const staged = otaCore.stageRelease(OTA_DIR, meta.version, buf);
+    if (!staged.ok) return sendJSON(res, 409, { error: staged.error });
+    state.otaStaged = {
+      version: meta.version,
+      project: meta.project,
+      size: staged.size,
+      sha256: staged.sha256,
+      staged_at: Date.now(),
+    };
+    const active = otaActiveInfo();
+    return sendJSON(res, 200, {
+      ok: true, staged: true,
+      version: meta.version, project: meta.project, size: staged.size, sha256: staged.sha256,
+      active_version: active.enabled ? active.manifest.version : null,
+    });
+  } catch (err) {
+    if (err && err.status === 413) return sendJSON(res, 413, { error: `firmware exceeds the 0x${OTA_SIZE_CAP.toString(16)} OTA cap` });
+    return sendJSON(res, 400, { error: String(err.message || err) });
+  } finally {
+    state.otaUploadBusy = false;
+  }
+}
+
+async function handleOtaInstall(res, body) {
+  const version = body && body.version;
+  if (typeof version !== 'string' || !OTA_SEMVER.test(version)) {
+    return sendJSON(res, 400, { error: 'version must be strict semver x.y.z' });
+  }
+  const binPath = path.join(OTA_DIR, 'releases', version, 'firmware.bin');
+  let bin;
+  try { bin = fs.readFileSync(binPath); }
+  catch { return sendJSON(res, 404, { error: `release ${version} is not staged — upload its firmware.bin first` }); }
+
+  const active = otaActiveInfo();
+  if (active.enabled && otaCore.compareVersions(version, active.manifest.version) <= 0) {
+    return sendJSON(res, 409, {
+      error: `version ${version} is not newer than the active release ${active.manifest.version}`,
+    });
+  }
+
+  const sha256 = otaCore.sha256hex(bin);
+  const activated = otaCore.activateRelease(OTA_DIR, {
+    enabled: true, version, project: OTA_PROJECT, chip: 'esp32s3',
+    layout: OTA_LAYOUT, size: bin.length, sha256,
+  });
+  if (!activated.ok) return sendJSON(res, 500, { error: activated.error });
+  state.otaStaged = null;
+  return sendJSON(res, 200, { ok: true, active_version: version, size: bin.length, sha256 });
+}
+
+function otaStatusObject() {
+  const info = otaActiveInfo();
+  return {
+    token_configured: Boolean(OTA_TOKEN),
+    enabled: info.enabled,
+    active_version: info.enabled ? info.manifest.version : null,
+    active_published_at: info.enabled && info.manifest.published_at ? info.manifest.published_at : null,
+    reported_version: state.otaReported.version,
+    reported_at: state.otaReported.at,
+    staged: state.otaStaged ? { ...state.otaStaged } : null,
+    downloads: { ...state.otaDownloads },
+    dir: OTA_DIR,
+  };
+}
 
 const SIM_INTERVAL_MS = 1000;   // 1 sample / second
 const SEC_MAX = 7200;           // keep 2 h of 1 s samples
@@ -69,6 +323,10 @@ const state = {
   prevDeviceP: { l1: 0, l2: 0, l3: 0 },
   lastDevicePush: 0,
   sequence: 0,
+  otaReported: { version: null, at: null },   // from UA EnergyAnalyzer-OTA/<v>
+  otaStaged: null,                            // uploaded, validated, not yet active
+  otaDownloads: { count: 0, last_at: null },  // ESP32 firmware.bin fetches
+  otaUploadBusy: false,
   sim: { running: true, multiplier: 1, noise: 1 },
   sec: [],                              // 1 s samples (latest last)
   min: [],                              // 1 min aggregates
@@ -294,6 +552,7 @@ function makeSample(now) {
       q, q_d: state.ema[ph].q = state.ema[ph].q !== undefined ? state.ema[ph].q * 0.998 + q * 0.002 : q,
       s: s2, s_d: state.ema[ph].s = state.ema[ph].s !== undefined ? state.ema[ph].s * 0.998 + s2 * 0.002 : s2,
       pf, cphi: pf,
+      freq: s.freq,
       e_wh: state.energyWh[ph],
     };
   }
@@ -380,26 +639,36 @@ function parseEsp32Sample(meter, receivedAt) {
     const v = vals.length === 1 ? vals[0] : vals[idx];
     return typeof v === 'number' && Number.isFinite(v) ? v : null;
   };
-  const freqRaw = gv('frequency', 0);
-  const s = {
-    t: receivedAt,
+  const POWER_KEYS = new Set(['p', 'p_d', 'q', 'q_d', 's', 's_d']);
+  const s = { t: receivedAt,
     seq: Number.isInteger(meter.sequence) ? meter.sequence : 0,
-    freq: freqRaw !== null && freqRaw > 0 ? freqRaw : null,   // 0 = no voltage inputs
-    l1: {}, l2: {}, l3: {}, tot: {},
-  };
+    freq: null, l1: {}, l2: {}, l3: {}, tot: {} };
+  const freqVals = [];
   for (const [idx, ph] of PHASES.entries()) {
     for (const [outKey, devKey] of Object.entries(DEVICE_GROUP_MAP)) {
-      s[ph][outKey] = gv(devKey, idx);
+      let v = gv(devKey, idx);
+      // The meter's power registers are in kW (demand block: 20 A × 220 V =
+      // 4.4 kW). Scale to W so integration and formatters stay correct.
+      if (v !== null && POWER_KEYS.has(outKey)) v *= 1000;
+      s[ph][outKey] = v;
     }
+    const f = gv('frequency', idx);
+    s[ph].freq = f !== null && f > 0 ? f : null;   // 0 = no voltage inputs
+    if (s[ph].freq !== null) freqVals.push(s[ph].freq);
     s[ph].e_wh = 0; // filled by server-side integration below
   }
+  s.freq = freqVals.length
+    ? freqVals.reduce((a, b) => a + b, 0) / freqVals.length : null;
   // Energy: the meter's energy registers are not decoded yet, so integrate
   // active power on the server. Never integrate across a communication outage.
   const gap = receivedAt - state.lastDevicePush;
   const dt = state.lastDevicePush && gap < DEVICE_STALE_MS ? Math.max(0, gap / 1000) : 0;
   for (const ph of PHASES) {
     const p = s[ph].p, prev = state.prevDeviceP[ph];
-    state.deviceEnergy[ph] += ((p === null ? 0 : p) + (prev === null ? 0 : prev)) / 2 * dt / 3600;
+    // Import energy never decreases; exporting phases (negative p) freeze it.
+    // The meter's export counters are outside the ESP32's 114-word window.
+    state.deviceEnergy[ph] = Math.max(0,
+      state.deviceEnergy[ph] + ((p === null ? 0 : p) + (prev === null ? 0 : prev)) / 2 * dt / 3600);
     s[ph].e_wh = state.deviceEnergy[ph];
     state.prevDeviceP[ph] = p;
   }
@@ -416,7 +685,7 @@ function parseEsp32Sample(meter, receivedAt) {
     vln_avg: avgVln.length ? avgVln.reduce((a, b) => a + b, 0) / avgVln.length : null,
     vll_avg: avgVll.length ? avgVll.reduce((a, b) => a + b, 0) / avgVll.length : null,
     i: sum('i'), p: pSum, q: sum('q'), s: sSum,
-    pf: pfRaw === null ? null : clamp(pfRaw, 0, 1),
+    pf: pfRaw === null ? null : clamp(pfRaw, -1, 1),
     e_wh: state.deviceEnergy.l1 + state.deviceEnergy.l2 + state.deviceEnergy.l3,
     imbalance_p: loadMeaningful
       ? (Math.max(s.l1.p, s.l2.p, s.l3.p) - Math.min(s.l1.p, s.l2.p, s.l3.p)) / (pSum / 3) * 100
@@ -623,6 +892,7 @@ function readingsPayload() {
       buffers: { sec: state.sec.length, min: state.min.length },
       device: deviceStatus(),
       db: dbStats(),
+      ota: otaStatusObject(),
     },
   };
 }
@@ -784,6 +1054,7 @@ const server = http.createServer(async (req, res) => {
         latest_seq: state.sequence,
         device: deviceStatus(),
         db: dbStats(),
+        ota: otaStatusObject(),
         ingest_endpoint: 'POST /api/ingest',
       });
     }
@@ -806,6 +1077,20 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'POST' && p === '/api/ingest') {
       return handleIngest(req, res, await readBody(req, MAX_BODY));
+    }
+    // OTA endpoints: private, pull-based firmware feed for the ESP32.
+    if (req.method === 'GET' && p === '/api/firmware/manifest') {
+      return handleOtaManifest(req, res);
+    }
+    if (req.method === 'GET' && p.startsWith('/firmware/')) {
+      return handleOtaBinary(req, res, p);
+    }
+    // OTA web flow: upload stages, install activates (dashboard admin side).
+    if (req.method === 'POST' && p === '/api/ota/upload') {
+      return handleOtaUpload(req, res);
+    }
+    if (req.method === 'POST' && p === '/api/ota/install') {
+      return handleOtaInstall(res, await readBody(req, MAX_BODY));
     }
     if (req.method === 'GET' || req.method === 'HEAD') {
       return serveStatic(req, res, p);

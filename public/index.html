@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#0d1513">
+  <meta name="theme-color" content="#0d1117">
   <meta name="description" content="Three-phase energy analytics for the TPM-04-100D analyzer.">
   <title>TPM-04-100D · Energy Analytics</title>
   <link rel="stylesheet" href="/styles.css">
@@ -249,6 +249,22 @@
             </label>
             <button class="btn" id="exportBtn" type="button">Download CSV</button>
             <p class="setting-note">Every sample (device and simulator) is stored in SQLite at <code id="dbPathNote">—</code>. Raw export is capped at 100,000 rows — pick a shorter range or a coarser granularity for big exports.</p>
+          </article>
+          <article class="panel">
+            <div class="panel-head"><h3>Firmware update</h3><span class="pill" id="otaPill">—</span></div>
+            <div class="setting-rows" id="otaRows"></div>
+            <label class="file-row">
+              <span class="btn file-btn">Choose firmware.bin</span>
+              <input type="file" id="otaFile" accept=".bin,application/octet-stream" hidden>
+              <span class="mono" id="otaFileName">no file selected</span>
+            </label>
+            <div class="ota-actions">
+              <button class="btn" id="otaUploadBtn" type="button" disabled>Upload & validate</button>
+              <button class="btn btn-primary" id="otaInstallBtn" type="button" disabled>Install Update</button>
+            </div>
+            <div class="ota-progress" id="otaProgress" hidden><div class="ota-progress-fill" id="otaProgressFill"></div></div>
+            <p class="setting-note" id="otaNote">Upload stages the firmware; Install Update atomically activates the release feed. The ESP32 picks it up on its next OTA poll and confirms back with its reported version.</p>
+            <p class="setting-note" id="otaMsg" hidden></p>
           </article>
           <article class="panel">
             <div class="panel-head"><h3>Simulator</h3><span class="pill warn">dev tool</span></div>

@@ -24,6 +24,7 @@
     phasesOn: { l1: true, l2: true, l3: true, total: true },
     provisionalShown: false,
     deviceBanner: false,
+    otaStagedVersion: null,
     rings: { power: [], energy: [], pf: [], freq: [], current: [], imbalance: [] },
     chartSpecs: [],          // {chart, series:[{phase,key,colorKey,label,...}]}
     lastHistory: null,
@@ -70,11 +71,18 @@
 
   // ---------------------------------------------------------------- chart engine
 
-  const chartPalette = () => ({
-    p1: cssVar('--p1'), p2: cssVar('--p2'), p3: cssVar('--p3'),
-    accent: cssVar('--accent'), muted: cssVar('--muted'), faint: cssVar('--faint'),
-    line: cssVar('--line'), ink: cssVar('--ink'), panel: cssVar('--panel'),
-  });
+  const chartPalette = () => {
+    const c = {
+      p1: cssVar('--p1'), p2: cssVar('--p2'), p3: cssVar('--p3'),
+      accent: cssVar('--accent'), muted: cssVar('--muted'), faint: cssVar('--faint'),
+      line: cssVar('--line'), ink: cssVar('--ink'), panel: cssVar('--panel'),
+    };
+    // Series defs address colors by their CSS variable name ('--p1'); expose
+    // both spellings so lookups never silently fall back to the accent color.
+    c['--p1'] = c.p1; c['--p2'] = c.p2; c['--p3'] = c.p3;
+    c['--accent'] = c.accent; c['--muted'] = c.muted; c['--faint'] = c.faint;
+    return c;
+  };
 
   function baseChartOptions() {
     const c = chartPalette();
@@ -481,8 +489,9 @@
     for (const [key, label, unit, get] of TABLE_GROUPS) {
       const { tr, cells } = tableCells.get(key);
       if (key === 'frequency') {
-        cells[0].textContent = finite(s.freq) ? fmt.Hz.format(s.freq) : 'Unavailable';
-        cells[1].textContent = '—'; cells[2].textContent = '—';
+        PHASES.forEach((ph, i) => {
+          cells[i].textContent = finite(s[ph].freq) ? fmt.Hz.format(s[ph].freq) : '—';
+        });
         continue;
       }
       PHASES.forEach((ph, i) => {
@@ -784,6 +793,76 @@
     }
   }
 
+  // ---------------------------------------------------------------- OTA panel
+
+  const cmpVersions = (a, b) => {
+    const pa = String(a).split('.').map(Number), pb = String(b).split('.').map(Number);
+    for (let i = 0; i < 3; i++) {
+      if (pa[i] > pb[i]) return 1;
+      if (pa[i] < pb[i]) return -1;
+    }
+    return 0;
+  };
+
+  function otaMsg(text, tone = '') {
+    const el = $('otaMsg');
+    el.hidden = !text;
+    el.textContent = text || '';
+    el.style.color = tone === 'ok' ? cssVar('--accent') : tone === 'err' ? cssVar('--red') : cssVar('--muted');
+  }
+
+  function updateOtaPanel(ota) {
+    if (!ota) return;
+    const pill = $('otaPill');
+    if (ota.enabled && ota.active_version) { pill.textContent = `feed on · ${ota.active_version}`; pill.className = 'pill good'; }
+    else if (ota.staged) { pill.textContent = 'staged · feed off'; pill.className = 'pill warn'; }
+    else { pill.textContent = 'feed inactive'; pill.className = 'pill'; }
+
+    const ago = ms => (ms == null ? '—' : `${Math.max(0, Math.round((Date.now() - ms) / 1000))} s ago`);
+    const rows = [
+      ['Active release', ota.active_version || 'none (feed disabled)'],
+      ['Active published', ota.active_published_at ? fmtClock(new Date(ota.active_published_at).getTime()) : '—'],
+      ['Staged release', ota.staged ? `${ota.staged.version} · ${fmtBytes(ota.staged.size)} · sha256 ${ota.staged.sha256.slice(0, 12)}…` : '—'],
+      ['Device reported version', ota.reported_version ? `${ota.reported_version} · ${ago(ota.reported_at)}` : 'not reported yet'],
+      ['Firmware downloads', ota.downloads && ota.downloads.count ? `${ota.downloads.count} · last ${ago(ota.downloads.last_at)}` : 'none yet'],
+      ['OTA token', ota.token_configured ? 'configured (server-only)' : 'NOT configured — ESP32 pulls are rejected'],
+    ];
+    const el = $('otaRows');
+    el.innerHTML = '';
+    for (const [k, v] of rows) {
+      const row = document.createElement('div');
+      row.className = 'setting-row';
+      row.innerHTML = `<span class="k">${k}</span><span class="v mono">${v}</span>`;
+      el.append(row);
+    }
+
+    // completion status: active release vs device-reported version vs downloads
+    const note = $('otaNote');
+    note.style.color = '';
+    if (ota.active_version && ota.reported_version === ota.active_version) {
+      note.textContent = `✓ Device confirmed on ${ota.reported_version} — update complete.`;
+      note.style.color = cssVar('--accent');
+    } else if (ota.active_version && ota.downloads && ota.downloads.count > 0) {
+      note.textContent = `Device downloaded ${ota.active_version} (${ota.downloads.count} fetch${ota.downloads.count === 1 ? '' : 'es'}) — waiting for it to report the new version.`;
+    } else if (ota.active_version) {
+      note.textContent = `Release ${ota.active_version} active — waiting for the ESP32 to poll the feed.`;
+    } else {
+      note.textContent = 'Upload stages the firmware; Install Update atomically activates the release feed. The ESP32 picks it up on its next OTA poll and confirms back with its reported version.';
+    }
+
+    S.otaStagedVersion = ota.staged ? ota.staged.version : S.otaStagedVersion;
+    const installBtn = $('otaInstallBtn');
+    if (ota.staged && (!ota.active_version || cmpVersions(ota.staged.version, ota.active_version) > 0)) {
+      S.otaStagedVersion = ota.staged.version;
+      installBtn.disabled = false;
+    } else if (!ota.staged) {
+      S.otaStagedVersion = null;
+      installBtn.disabled = true;
+    } else {
+      installBtn.disabled = true; // staged but not newer than active
+    }
+  }
+
   function updateSourcePills(data) {
     const source = data && data.source;
     const meta = data && data.meta;
@@ -818,6 +897,15 @@
         dotCls = S.paused ? 'dot warn' : 'dot ok pulse';
       }
       sideText = pillText;
+      if (data.sample) {
+        const reversed = PHASES.filter(ph =>
+          finite(data.sample[ph].pf) && data.sample[ph].pf < -0.5);
+        if (reversed.length) {
+          bannerMsg = (bannerMsg ? bannerMsg + ' ' : '') +
+            `${reversed.map(p => p.toUpperCase()).join('/')} report reverse power flow ` +
+            '(negative power factor) — check CT orientation or export direction.';
+        }
+      }
     } else {
       if (sim && sim.running) {
         pillText = 'Simulation'; pillCls = 'pill warn'; dotCls = 'dot ok pulse';
@@ -870,6 +958,7 @@
         $('dbPill').textContent = 'unavailable';
         $('dbPill').className = 'pill bad';
       }
+      if (meta.ota) updateOtaPanel(meta.ota);
     }
     const agoS = ms => (ms == null ? '—' : `${Math.max(0, Math.round((Date.now() - ms) / 1000))} s ago`);
     const rows = [
@@ -1021,6 +1110,68 @@
       const range = $('exportRange').value;
       const group = $('exportGroup').value;
       window.location.href = `/api/export?range=${encodeURIComponent(range)}&group=${encodeURIComponent(group)}`;
+    });
+    // firmware update flow
+    $('otaFile').addEventListener('change', () => {
+      const f = $('otaFile').files && $('otaFile').files[0];
+      $('otaFileName').textContent = f ? `${f.name} (${fmtBytes(f.size)})` : 'no file selected';
+      $('otaUploadBtn').disabled = !f;
+      if (!f) return;
+      if (f.size > 0x3f0000) {
+        otaMsg(`✗ ${f.name} is ${fmtBytes(f.size)} — exceeds the 0x3f0000 OTA partition cap.`, 'err');
+        $('otaUploadBtn').disabled = true;
+      } else {
+        otaMsg('');
+      }
+    });
+    $('otaUploadBtn').addEventListener('click', () => {
+      const f = $('otaFile').files && $('otaFile').files[0];
+      if (!f) return;
+      const btn = $('otaUploadBtn');
+      btn.disabled = true; btn.textContent = 'Uploading…';
+      const prog = $('otaProgress'), fill = $('otaProgressFill');
+      prog.hidden = false; fill.style.width = '0%';
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/api/ota/upload');
+      xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+      xhr.upload.onprogress = e => {
+        if (e.lengthComputable) fill.style.width = `${Math.round(e.loaded / e.total * 100)}%`;
+      };
+      const finish = (text, tone) => {
+        prog.hidden = true;
+        btn.disabled = false; btn.textContent = 'Upload & validate';
+        otaMsg(text, tone);
+      };
+      xhr.onload = () => {
+        let data = null;
+        try { data = JSON.parse(xhr.responseText); } catch { /* non-JSON */ }
+        if (xhr.status === 200 && data && data.ok) {
+          finish(`✓ ${data.project} ${data.version} staged (${fmtBytes(data.size)}, sha256 ${data.sha256.slice(0, 12)}…). Click Install Update to activate.`, 'ok');
+        } else {
+          finish(`✗ ${(data && data.error) || `upload failed (HTTP ${xhr.status})`}`, 'err');
+        }
+      };
+      xhr.onerror = () => finish('✗ upload failed — network error.', 'err');
+      xhr.send(f);
+    });
+    $('otaInstallBtn').addEventListener('click', () => {
+      const version = S.otaStagedVersion;
+      if (!version) return;
+      if (!window.confirm(`Install and activate firmware ${version}? The ESP32 will download and flash it on its next OTA poll.`)) return;
+      const btn = $('otaInstallBtn');
+      btn.disabled = true; btn.textContent = 'Installing…';
+      fetch('/api/ota/install', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ version }),
+      }).then(async r => {
+        const d = await r.json().catch(() => ({}));
+        btn.textContent = 'Install Update';
+        if (r.ok && d.ok) {
+          otaMsg(`✓ ${d.active_version} activated — waiting for the ESP32 to download it.`, 'ok');
+        } else {
+          otaMsg(`✗ ${d.error || `install failed (HTTP ${r.status})`}`, 'err');
+        }
+      }).catch(() => { btn.textContent = 'Install Update'; otaMsg('✗ install failed — network error.', 'err'); });
     });
     $('pollInterval').addEventListener('change', e => {
       S.pollMs = Number(e.target.value) * 1000;

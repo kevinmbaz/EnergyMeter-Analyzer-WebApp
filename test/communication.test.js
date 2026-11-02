@@ -165,6 +165,50 @@ test('zero measurements and an unknown adapter flag are not disconnection eviden
   assert.equal(body.sample.tot.p, 0);
 });
 
+test('power registers arrive in kW and are scaled to W; per-phase frequency is preserved', async () => {
+  const h = serverHarness();
+  h.ingest(meter({ groups: [
+    { key: 'active_power', values: [0.5, 1, 1.5] },
+    { key: 'reactive_power', values: [0.1, 0.2, 0.3] },
+    { key: 'apparent_power', values: [0.5, 1, 1.5] },
+    { key: 'active_power_demand', values: [4.403, 4.402, 4.402] },
+    { key: 'apparent_power_demand', values: [4.403, 4.402, 4.402] },
+    { key: 'voltage_ln', values: [230, 230, 230] },
+    { key: 'frequency', values: [50, 50.1, 49.9] },
+  ] }));
+  const { body } = await h.get('/api/readings');
+  assert.equal(body.sample.l1.p, 500);
+  assert.equal(body.sample.l2.p, 1000);
+  assert.equal(body.sample.l3.p, 1500);
+  assert.equal(body.sample.tot.p, 3000);
+  assert.equal(body.sample.l1.p_d, 4403);
+  assert.equal(body.sample.l1.q, 100);
+  assert.equal(body.sample.l1.s, 500);
+  assert.equal(body.sample.l2.freq, 50.1);
+  assert.equal(body.sample.l3.freq, 49.9);
+  assert.equal(body.sample.freq, 50);
+});
+
+test('total power factor keeps its sign so reverse power flow is visible', async () => {
+  const h = serverHarness();
+  h.ingest(meter({ groups: [
+    { key: 'active_power', values: [0.1, -0.9, -0.8] },
+    { key: 'apparent_power', values: [0.1, 0.9, 0.8] },
+  ] }));
+  const { body } = await h.get('/api/readings');
+  assert.ok(body.sample.tot.pf < 0);
+});
+
+test('negative (exporting) power does not reduce accumulated import energy', async () => {
+  const h = serverHarness();
+  h.ingest(meter({ groups: [{ key: 'active_power', values: [-1, -1, -1] }] }));
+  h.advance(2000);
+  h.ingest(meter({ groups: [{ key: 'active_power', values: [-1, -1, -1] }], sequence: 2 }));
+  const { body } = await h.get('/api/readings');
+  assert.equal(body.sample.tot.e_wh, 0);
+  assert.equal(body.sample.l1.e_wh, 0);
+});
+
 test('loss of ESP32 contact is offline, not just a generic stale meter', async () => {
   const h = serverHarness();
   h.ingest(meter());

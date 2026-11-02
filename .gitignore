@@ -10,3 +10,5 @@ npm-debug.log*
 .vscode/
 .idea/
 data/
+firmware/
+*.secrets.json
